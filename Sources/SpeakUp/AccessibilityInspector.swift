@@ -45,10 +45,25 @@ enum AccessibilityInspector {
     /// Returns whether this process is trusted for Accessibility.
     /// If `promptIfNeeded` is true and not trusted, macOS shows the
     /// "App would like to control this computer" system prompt.
+    ///
+    /// AXIsProcessTrustedWithOptions caches its result per-process — once
+    /// the app has been trusted, it keeps returning true even after the user
+    /// removes it from System Settings → Accessibility, until the app restarts.
+    /// We bypass the cache by making a real AX API call and checking the error
+    /// code: kAXErrorNotTrusted (-25211) means genuinely not trusted right now.
+    /// Any other result (success, noValue, etc.) means we ARE trusted.
     static func isTrusted(promptIfNeeded: Bool) -> Bool {
-        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
-        let options: NSDictionary = [key: promptIfNeeded]
-        return AXIsProcessTrustedWithOptions(options)
+        if promptIfNeeded {
+            // Trigger the system prompt if needed — but ignore the cached return value.
+            let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
+            _ = AXIsProcessTrustedWithOptions([key: true] as NSDictionary)
+        }
+        // Live probe: hits the AX server directly, not the per-process cache.
+        // kAXErrorNotTrusted = -25211 (not bridged as a Swift enum case).
+        let systemWide = AXUIElementCreateSystemWide()
+        var ref: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &ref)
+        return err.rawValue != -25211
     }
 
     /// Chromium-based apps (Chrome, and Electron apps like Claude desktop)

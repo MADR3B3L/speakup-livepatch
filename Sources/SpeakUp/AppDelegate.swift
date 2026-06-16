@@ -18,6 +18,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var flagsMonitor: Any?
     var localFlagsMonitor: Any?
     let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/speakup-poc-log.txt")
+    var lastCommandHeard: String?
+    private var userCommands: [String: CommandSpec] = [:]
+    private let userCommandsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/user-commands.json")
+    private var userCommandsWatcher: DispatchSourceFileSystemObject?
 
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
@@ -100,6 +104,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         appendLog("=== SpeakUp PoC launched ===")
         logPermissionStatus()
+        loadUserCommands()
+        installUserCommandsWatcher()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -145,6 +151,100 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let axTrusted = AccessibilityInspector.isTrusted(promptIfNeeded: false)
         appendLog("Accessibility trusted: \(axTrusted)")
         appendLog("Microphone status: \(MicrophonePermission.statusDescription())")
+    }
+
+    // MARK: - User Commands (dynamic, persisted in ~/Documents/SpeakUp/user-commands.json)
+
+    private func loadUserCommands() {
+        guard let data = try? Data(contentsOf: userCommandsURL),
+              let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            userCommands = [:]
+            return
+        }
+        var result: [String: CommandSpec] = [:]
+        for entry in entries {
+            guard let phrase = entry["phrase"] as? String,
+                  let keyCodeRaw = entry["keyCode"] as? Int,
+                  let flagsRaw = entry["flags"] as? UInt64,
+                  let label = entry["label"] as? String else { continue }
+            result[phrase] = CommandSpec(keyCode: CGKeyCode(keyCodeRaw), flags: CGEventFlags(rawValue: flagsRaw), label: label)
+        }
+        userCommands = result
+        if !result.isEmpty {
+            appendLog("[UserCommands] Loaded \(result.count) user-defined command(s): \(result.keys.sorted().joined(separator: ", "))")
+        }
+    }
+
+    private func addUserCommand(phrase: String, spec: CommandSpec) {
+        guard let keyCode = spec.keyCode else { return }
+        var entries: [[String: Any]] = []
+        if let data = try? Data(contentsOf: userCommandsURL),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            entries = existing.filter { $0["phrase"] as? String != phrase }
+        }
+        entries.append([
+            "phrase": phrase,
+            "keyCode": Int(keyCode),
+            "flags": spec.flags.rawValue,
+            "label": spec.label,
+        ])
+        try? FileManager.default.createDirectory(at: userCommandsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) {
+            try? data.write(to: userCommandsURL)
+        }
+    }
+
+    private func installUserCommandsWatcher() {
+        try? FileManager.default.createDirectory(at: userCommandsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: userCommandsURL.path) {
+            try? "[]".data(using: .utf8)?.write(to: userCommandsURL)
+        }
+        let fd = open(userCommandsURL.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.loadUserCommands()
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        userCommandsWatcher = source
+    }
+
+    /// Called after every report save. Scans the captured log lines for
+    /// "isn't a recognized command", extracts the unknown phrase, and if it
+    /// exists in the reference dictionary adds it to user-commands.json
+    /// automatically — no rebuild, no manual step.
+    /// Commands that auto-learn must never touch. Destructive, system-level,
+    /// or high-risk phrases are blocked regardless of what the log says.
+    private static let autoLearnBlocklist: Set<String> = [
+        "quit", "force quit", "delete", "delete all", "format", "erase",
+        "shutdown", "restart", "reboot", "sleep", "log out", "sign out",
+        "empty trash", "force close", "kill", "terminate",
+        "clear", "clear all", "reset", "wipe",
+    ]
+
+    private func processReportForAutoLearn(logLines: [String]) {
+        for line in logLines {
+            guard line.contains("isn't a recognized command"),
+                  let butRange = line.range(of: "but \""),
+                  let isntRange = line.range(of: "\" isn't", range: butRange.upperBound..<line.endIndex) else { continue }
+            let phrase = String(line[butRange.upperBound..<isntRange.lowerBound]).lowercased()
+            guard !phrase.isEmpty,
+                  Self.commands[phrase] == nil,
+                  userCommands[phrase] == nil else { continue }
+            if Self.autoLearnBlocklist.contains(phrase) {
+                appendLog("[AutoLearn] \"\(phrase)\" is on the destructive blocklist — skipped")
+                continue
+            }
+            if let spec = Self.referenceCommands[phrase] {
+                addUserCommand(phrase: phrase, spec: spec)
+                userCommands[phrase] = spec
+                appendLog("[AutoLearn] \"\(phrase)\" → \(spec.label) — added to user-commands.json")
+                notify("SpeakUp learned: \"\(phrase)\"", spec.label)
+            } else {
+                appendLog("[AutoLearn] \"\(phrase)\" not in reference dict — skipped (not safe to invent)")
+            }
+        }
     }
 
     // MARK: - Inspection
@@ -518,13 +618,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Debounced "the user stopped talking" detector: each new partial
     /// resets this timer (Extension: AUTO_SETTLE_MS). When it fires, the
     /// current transcript is treated as a finished phrase.
+    /// Report commands get an extra second so the description after "report
+    /// issue" / "mac report bug" has time to arrive before we cut off.
     private func scheduleLivePhraseSettle() {
         phraseSettleWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.finishLivePhrase()
         }
         phraseSettleWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + phraseSettleDelay, execute: workItem)
+        let partial = speechCapture.lastTranscript.lowercased()
+        let isReportCommand = partial.hasPrefix("report ") || partial.hasPrefix("mac report")
+            || partial.hasPrefix("capture bug") || partial.hasPrefix("capture issue")
+            || partial.hasPrefix("capture feedback")
+        let delay = isReportCommand ? phraseSettleDelay + 1.0 : phraseSettleDelay
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func finishLivePhrase() {
@@ -594,7 +701,115 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         static let upArrow: CGKeyCode = 0x7E
         static let downArrow: CGKeyCode = 0x7D
         static let four: CGKeyCode = 0x15
+        static let three: CGKeyCode = 0x14
+        static let zero: CGKeyCode = 0x1D
+        static let d: CGKeyCode = 0x02
+        static let h: CGKeyCode = 0x04
+        static let o: CGKeyCode = 0x1F
+        static let slash: CGKeyCode = 0x2C
+        static let forwardDelete: CGKeyCode = 0x75
+        static let pageUp: CGKeyCode = 0x74
+        static let pageDown: CGKeyCode = 0x79
+        static let home: CGKeyCode = 0x73
+        static let end: CGKeyCode = 0x77
     }
+
+    /// Bundled map of natural-language words → key combos for auto-learn.
+    /// When a report flags an unrecognized command that exists here, SpeakUp
+    /// adds it to user-commands.json automatically — no rebuild needed.
+    private static let referenceCommands: [String: CommandSpec] = [
+        // Text formatting
+        "bold":                 CommandSpec(keyCode: KeyCode.b,            flags: .maskCommand,                      label: "⌘B (bold)"),
+        "italic":               CommandSpec(keyCode: KeyCode.i,            flags: .maskCommand,                      label: "⌘I (italic)"),
+        "italics":              CommandSpec(keyCode: KeyCode.i,            flags: .maskCommand,                      label: "⌘I (italic)"),
+        "underline":            CommandSpec(keyCode: KeyCode.u,            flags: .maskCommand,                      label: "⌘U (underline)"),
+        "comment":              CommandSpec(keyCode: KeyCode.slash,        flags: .maskCommand,                      label: "⌘/ (toggle comment)"),
+        "toggle comment":       CommandSpec(keyCode: KeyCode.slash,        flags: .maskCommand,                      label: "⌘/ (toggle comment)"),
+
+        // File
+        "save":                 CommandSpec(keyCode: KeyCode.s,            flags: .maskCommand,                      label: "⌘S (save)"),
+        "save as":              CommandSpec(keyCode: KeyCode.s,            flags: [.maskCommand, .maskShift],        label: "⌘⇧S (save as)"),
+        "print":                CommandSpec(keyCode: KeyCode.p,            flags: .maskCommand,                      label: "⌘P (print)"),
+        "open":                 CommandSpec(keyCode: KeyCode.o,            flags: .maskCommand,                      label: "⌘O (open)"),
+        "duplicate":            CommandSpec(keyCode: KeyCode.d,            flags: .maskCommand,                      label: "⌘D (duplicate)"),
+        "reload":               CommandSpec(keyCode: KeyCode.r,            flags: .maskCommand,                      label: "⌘R (reload)"),
+        "refresh":              CommandSpec(keyCode: KeyCode.r,            flags: .maskCommand,                      label: "⌘R (refresh)"),
+
+        // Word-level navigation
+        "word left":            CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskAlternate,                    label: "⌥← (word left)"),
+        "word back":            CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskAlternate,                    label: "⌥← (word back)"),
+        "word right":           CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskAlternate,                    label: "⌥→ (word right)"),
+        "word forward":         CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskAlternate,                    label: "⌥→ (word forward)"),
+
+        // Line-level navigation
+        "line start":           CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (line start)"),
+        "start of line":        CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (start of line)"),
+        "beginning of line":    CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (beginning of line)"),
+        "line end":             CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskCommand,                      label: "⌘→ (line end)"),
+        "end of line":          CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskCommand,                      label: "⌘→ (end of line)"),
+
+        // Document-level navigation
+        "go to top":            CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
+        "top of document":      CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
+        "document top":         CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
+        "go to bottom":         CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
+        "bottom of document":   CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
+        "document bottom":      CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
+        "page up":              CommandSpec(keyCode: KeyCode.pageUp,      flags: [],                                label: "Page Up"),
+        "page down":            CommandSpec(keyCode: KeyCode.pageDown,    flags: [],                                label: "Page Down"),
+        "scroll up":            CommandSpec(keyCode: KeyCode.pageUp,      flags: [],                                label: "Page Up"),
+        "scroll down":          CommandSpec(keyCode: KeyCode.pageDown,    flags: [],                                label: "Page Down"),
+        "home":                 CommandSpec(keyCode: KeyCode.home,        flags: [],                                label: "Home"),
+        "end":                  CommandSpec(keyCode: KeyCode.end,         flags: [],                                label: "End"),
+
+        // Selection extension
+        "select right":         CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskShift,                        label: "⇧→ (select right)"),
+        "select left":          CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskShift,                        label: "⇧← (select left)"),
+        "select up":            CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskShift,                        label: "⇧↑ (select up)"),
+        "select down":          CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskShift,                        label: "⇧↓ (select down)"),
+        "select word right":    CommandSpec(keyCode: KeyCode.rightArrow,  flags: [.maskShift, .maskAlternate],      label: "⌥⇧→ (select word right)"),
+        "select word left":     CommandSpec(keyCode: KeyCode.leftArrow,   flags: [.maskShift, .maskAlternate],      label: "⌥⇧← (select word left)"),
+        "select to end":        CommandSpec(keyCode: KeyCode.rightArrow,  flags: [.maskShift, .maskCommand],        label: "⌘⇧→ (select to end of line)"),
+        "select to start":      CommandSpec(keyCode: KeyCode.leftArrow,   flags: [.maskShift, .maskCommand],        label: "⌘⇧← (select to start of line)"),
+        "select to top":        CommandSpec(keyCode: KeyCode.upArrow,     flags: [.maskShift, .maskCommand],        label: "⌘⇧↑ (select to top)"),
+        "select to bottom":     CommandSpec(keyCode: KeyCode.downArrow,   flags: [.maskShift, .maskCommand],        label: "⌘⇧↓ (select to bottom)"),
+
+        // Deletion
+        "delete word":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
+        "delete word back":     CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
+        "delete line":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskCommand,                      label: "⌘⌫ (delete to line start)"),
+        "forward delete":       CommandSpec(keyCode: KeyCode.forwardDelete, flags: [],                              label: "⌦ (forward delete)"),
+        "delete forward":       CommandSpec(keyCode: KeyCode.forwardDelete, flags: [],                              label: "⌦ (forward delete)"),
+
+        // Window / app
+        "minimize":             CommandSpec(keyCode: KeyCode.m,           flags: .maskCommand,                      label: "⌘M (minimize)"),
+        "hide":                 CommandSpec(keyCode: KeyCode.h,           flags: .maskCommand,                      label: "⌘H (hide)"),
+        "full screen":          CommandSpec(keyCode: KeyCode.f,           flags: [.maskCommand, .maskControl],      label: "⌃⌘F (full screen)"),
+        "zoom window":          CommandSpec(keyCode: KeyCode.f,           flags: [.maskCommand, .maskControl],      label: "⌃⌘F (full screen)"),
+        "zoom in":              CommandSpec(keyCode: KeyCode.equals,      flags: .maskCommand,                      label: "⌘= (zoom in)"),
+        "zoom out":             CommandSpec(keyCode: KeyCode.minus,       flags: .maskCommand,                      label: "⌘- (zoom out)"),
+        "actual size":          CommandSpec(keyCode: KeyCode.zero,        flags: .maskCommand,                      label: "⌘0 (actual size)"),
+        "reset zoom":           CommandSpec(keyCode: KeyCode.zero,        flags: .maskCommand,                      label: "⌘0 (reset zoom)"),
+
+        // Browser
+        "back":                 CommandSpec(keyCode: KeyCode.leftBracket, flags: .maskCommand,                      label: "⌘[ (back)"),
+        "go back":              CommandSpec(keyCode: KeyCode.leftBracket, flags: .maskCommand,                      label: "⌘[ (go back)"),
+        "forward":              CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (forward)"),
+        "go forward":           CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (go forward)"),
+
+        // Code
+        "indent":               CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (indent)"),
+        "outdent":              CommandSpec(keyCode: KeyCode.leftBracket,  flags: .maskCommand,                     label: "⌘[ (outdent)"),
+        "unindent":             CommandSpec(keyCode: KeyCode.leftBracket,  flags: .maskCommand,                     label: "⌘[ (outdent)"),
+
+        // Screenshots
+        "screenshot":           CommandSpec(keyCode: KeyCode.three,       flags: [.maskCommand, .maskShift],        label: "⌘⇧3 (screenshot)"),
+        "screenshot area":      CommandSpec(keyCode: KeyCode.four,        flags: [.maskCommand, .maskShift],        label: "⌘⇧4 (screenshot area)"),
+
+        // Emoji / special characters
+        "emoji":                CommandSpec(keyCode: KeyCode.space,       flags: [.maskCommand, .maskControl],      label: "⌃⌘Space (emoji picker)"),
+        "special characters":   CommandSpec(keyCode: KeyCode.space,       flags: [.maskCommand, .maskControl],      label: "⌃⌘Space (special characters)"),
+    ]
 
     /// NX_KEYTYPE_* constants for the "media key" system-defined events
     /// (play/pause, next/previous track, volume, brightness, mute). These
@@ -713,6 +928,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "cut that": CommandSpec(keyCode: KeyCode.x, flags: .maskCommand, label: "⌘X (cut)"),
 
         "select all": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+        // STT sometimes drops "all" and hears just "select" — catch both.
+        "select": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+        "grab all": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+        "highlight all": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+
+        // Right arrow collapses any active text selection without moving
+        // the cursor outside the field — the standard keyboard "deselect".
+        "deselect": CommandSpec(keyCode: KeyCode.rightArrow, flags: [], label: "→ (deselect)"),
+        "deselect all": CommandSpec(keyCode: KeyCode.rightArrow, flags: [], label: "→ (deselect)"),
+        "clear selection": CommandSpec(keyCode: KeyCode.rightArrow, flags: [], label: "→ (deselect)"),
 
         "undo": CommandSpec(keyCode: KeyCode.z, flags: .maskCommand, label: "⌘Z (undo)"),
         "undo that": CommandSpec(keyCode: KeyCode.z, flags: .maskCommand, label: "⌘Z (undo)"),
@@ -913,6 +1138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// after the kind ("note"/"reminder"/"task"/"idea") aren't looked up in
     /// a table — they're the content to capture, verbatim.
     private static let captureTriggerWord = "capture"
+    private static let reportTriggerWord = "report"
 
     /// Same idea as `commandModeWindow`, but much shorter: 5s instead of
     /// 30s. Used by both the `media` and `display` families. Their
@@ -1182,6 +1408,75 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
+            // "mac report <kind>" / "mac report <kind> <text>" — file a report from
+            // the mac family. "mac report bug" alone is valid (saves context snapshot).
+            // "mac report issue paste fired twice" includes a description.
+            if rest2.hasPrefix("report ") || rest2 == "report" {
+                let afterReport = rest2.hasPrefix("report ") ? String(rest2.dropFirst("report ".count)) : ""
+                let reportWords = afterReport.split(separator: " ").map(String.init)
+                let kind = reportWords.first ?? "report"
+                let text = reportWords.count > 1 ? reportWords.dropFirst().joined(separator: " ") : ""
+                handleCapture(kind: kind, text: text, phrase: phrase)
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac show learned commands" — lists what auto-learn has added
+            if rest2 == "show learned commands" || rest2 == "show learned" {
+                if userCommands.isEmpty {
+                    notify("SpeakUp learned commands", "None yet — report a failed command to teach me")
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> no learned commands yet")
+                } else {
+                    let list = userCommands.keys.sorted().joined(separator: ", ")
+                    notify("SpeakUp learned (\(userCommands.count))", list)
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> learned commands: \(list)")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac show reports" — opens the SpeakUp reports folder in Finder
+            if rest2 == "show reports" {
+                let reportsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/reports")
+                try? FileManager.default.createDirectory(at: reportsURL, withIntermediateDirectories: true)
+                NSWorkspace.shared.open(reportsURL)
+                appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> opened reports folder in Finder")
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                notify("SpeakUp heard: \(phrase)", "Opened reports folder")
+                return true
+            }
+
+            // "mac package reports" — zips ~/Documents/SpeakUp/reports to Desktop
+            if rest2 == "package reports" {
+                let speakupDir = NSHomeDirectory() + "/Documents/SpeakUp"
+                let desktopPath = NSHomeDirectory() + "/Desktop"
+                let fmt = ISO8601DateFormatter()
+                fmt.formatOptions = [.withFullDate]
+                let zipName = "speakup-reports-\(fmt.string(from: Date())).zip"
+                let zipPath = desktopPath + "/" + zipName
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+                proc.arguments = ["-r", zipPath, "reports"]
+                proc.currentDirectoryURL = URL(fileURLWithPath: speakupDir)
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    if proc.terminationStatus == 0 {
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packaged reports to \(zipPath)")
+                        NSWorkspace.shared.selectFile(zipPath, inFileViewerRootedAtPath: desktopPath)
+                        notify("SpeakUp heard: \(phrase)", "Saved \(zipName) to Desktop")
+                    } else {
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> zip exited \(proc.terminationStatus) (no reports yet?)")
+                        notify("SpeakUp heard: \(phrase)", "Package failed — no reports yet?")
+                    }
+                } catch {
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> zip failed: \(error)")
+                    notify("SpeakUp heard: \(phrase)", "Package reports failed")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
             var notifyBody: String? = nil
             // Longest/most-specific prefixes first — "search for " must be
             // checked before bare "search ", or "search for pizza" would
@@ -1315,13 +1610,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
+        // --- "report <kind> <text...>" family ---
+        // "report bug" alone is valid — saves context snapshot with no body text.
+        // "report bug paste fired twice" includes a description too.
+        if let first = words.first, first == Self.reportTriggerWord, words.count > 1 {
+            let kind = words[1]
+            let text = words.count > 2 ? words.dropFirst(2).joined(separator: " ") : ""
+            handleCapture(kind: kind, text: text, phrase: phrase)
+            commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+            return true
+        }
+
         // --- "action <cmd>" family + 30s bare-word window ---
         let rest: String
         let triggeredByActionWord: Bool
         if let first = words.first, first == Self.commandTriggerWord, words.count > 1 {
             rest = words.dropFirst().joined(separator: " ")
             triggeredByActionWord = true
-        } else if inCommandMode, Self.commands[normalized] != nil {
+        } else if inCommandMode, userCommands[normalized] != nil || Self.commands[normalized] != nil {
             // Bare command word inside the 30s window after a prior command.
             rest = normalized
             triggeredByActionWord = false
@@ -1329,7 +1635,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
-        guard let spec = Self.commands[rest] else {
+        guard let spec = userCommands[rest] ?? Self.commands[rest] else {
             // Only "action <unrecognized>" gets here (the bare-word branch
             // above already checked Self.commands[normalized] != nil) —
             // swallow it so an unrecognized command word doesn't also get
@@ -1362,28 +1668,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// "capture <kind> <text>" — creates something in Notes or Reminders via
-    /// osascript, without touching the focused app's text field at all.
-    /// "note"/"idea" -> Notes; "reminder"/"task"/"todo" -> Reminders.
+    /// "capture <kind> <text>" — creates something in Notes/Reminders or saves a
+    /// structured report. "note" -> Notes; "reminder"/"task"/"todo" -> Reminders;
+    /// "bug"/"issue"/"feedback"/"report" -> JSONL report file; "idea" -> both Notes and report.
     private func handleCapture(kind: String, text: String, phrase: String) {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else {
-            appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture \"\(kind)\" had no content, ignored")
-            notify("SpeakUp heard: \(phrase)", "Nothing to capture")
-            return
-        }
         switch kind {
         case "note", "notes":
+            guard !trimmed.isEmpty else {
+                notify("SpeakUp heard: \(phrase)", "Nothing to capture")
+                return
+            }
             captureNote(trimmed)
             notify("SpeakUp heard: \(phrase)", "Saved note: \"\(trimmed)\"")
         case "idea", "ideas":
+            guard !trimmed.isEmpty else {
+                notify("SpeakUp heard: \(phrase)", "Nothing to capture")
+                return
+            }
             captureNote("Idea: \(trimmed)")
-            notify("SpeakUp heard: \(phrase)", "Saved idea: \"\(trimmed)\"")
+            saveReport(type: "idea", text: trimmed, phrase: phrase)
         case "reminder", "reminders", "task", "tasks", "todo":
+            guard !trimmed.isEmpty else {
+                notify("SpeakUp heard: \(phrase)", "Nothing to capture")
+                return
+            }
             captureReminder(trimmed)
             notify("SpeakUp heard: \(phrase)", "Saved reminder: \"\(trimmed)\"")
+        case "bug", "bugs":
+            saveReport(type: "bug", text: trimmed, phrase: phrase)
+        case "issue", "issues":
+            saveReport(type: "issue", text: trimmed, phrase: phrase)
+        case "feedback":
+            saveReport(type: "feedback", text: trimmed, phrase: phrase)
+        case "report":
+            saveReport(type: "report", text: trimmed, phrase: phrase)
         default:
-            appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture kind \"\(kind)\" not recognized (try \"note\", \"reminder\", \"task\", or \"idea\") — ignored")
+            appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture kind \"\(kind)\" not recognized (try \"bug\", \"issue\", \"feedback\", \"note\", \"reminder\", or \"idea\") — ignored")
             notify("SpeakUp heard: \(phrase)", "Capture type \"\(kind)\" not recognized")
         }
     }
@@ -1393,6 +1714,101 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let escaped = appleScriptEscape(text)
         let script = "tell application \"Notes\" to make new note at folder \"Notes\" with properties {body:\"\(escaped)\"}"
         runShellCommand(script, label: "Capture note: \"\(text)\"")
+    }
+
+    /// Appends a structured report entry to ~/Documents/SpeakUp/reports/speakup-reports.jsonl.
+    /// Captures app context, AX/Speech permission state, and the last 10 log lines automatically.
+    private func saveReport(type reportType: String, text: String, phrase: String) {
+        let reportsDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/reports")
+        let reportsFile = reportsDir.appendingPathComponent("speakup-reports.jsonl")
+        try? FileManager.default.createDirectory(at: reportsDir, withIntermediateDirectories: true)
+
+        let id = UUID().uuidString
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+
+        // Frontmost app + window title via AX
+        let frontApp = lastExternalApp?.localizedName
+        var windowTitle: String? = nil
+        if let app = lastExternalApp {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var winRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
+               let win = winRef {
+                var titleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success {
+                    windowTitle = titleRef as? String
+                }
+            }
+        }
+
+        // Permission state snapshot
+        let axTrusted = AXIsProcessTrusted()
+        let speechAuth: String
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized: speechAuth = "authorized"
+        case .denied: speechAuth = "denied"
+        case .restricted: speechAuth = "restricted"
+        case .notDetermined: speechAuth = "notDetermined"
+        @unknown default: speechAuth = "unknown"
+        }
+
+        // Last 10 log lines for context
+        var lastLogLines: [String] = []
+        if let data = try? Data(contentsOf: logURL),
+           let logText = String(data: data, encoding: .utf8) {
+            lastLogLines = Array(logText.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(10))
+        }
+
+        var dict: [String: Any] = [
+            "id": id,
+            "timestamp": timestamp,
+            "report_type": reportType,
+            "user_text": text,
+            "raw_transcript": phrase,
+            "live_mode_state": liveModeOn ? "on" : "off",
+            "accessibility_trusted": axTrusted,
+            "speech_authorized": speechAuth,
+            "last_10_log_lines": lastLogLines,
+        ]
+        if let v = frontApp { dict["frontmost_app"] = v }
+        if let v = windowTitle { dict["frontmost_window_title"] = v }
+        if let v = lastCommandHeard { dict["last_command_heard"] = v }
+        if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String { dict["app_version"] = v }
+        if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String { dict["build_version"] = v }
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+              let jsonLine = String(data: jsonData, encoding: .utf8) else {
+            appendLog("[LivePatch] [Report] failed to serialize \(reportType) report")
+            return
+        }
+        let line = jsonLine + "\n"
+        if FileManager.default.fileExists(atPath: reportsFile.path) {
+            if let handle = try? FileHandle(forWritingTo: reportsFile),
+               let data = line.data(using: .utf8) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            }
+        } else {
+            try? line.data(using: .utf8)?.write(to: reportsFile)
+        }
+
+        let summary = String(text.prefix(60))
+        appendLog("[LivePatch] [Report] saved \(reportType): \(id) \"\(summary)\"")
+
+        // Auto-learn: scan the captured log lines for unrecognized commands
+        // and add them from the reference dictionary if possible.
+        processReportForAutoLearn(logLines: lastLogLines)
+
+        let notifTitle: String
+        switch reportType {
+        case "bug": notifTitle = "SpeakUp saved bug report"
+        case "issue": notifTitle = "SpeakUp saved issue"
+        case "feedback": notifTitle = "SpeakUp saved feedback"
+        case "idea": notifTitle = "SpeakUp saved idea"
+        default: notifTitle = "SpeakUp saved \(reportType)"
+        }
+        notify(notifTitle, "\"\(summary)\"")
     }
 
     /// Creates a new Reminders item via osascript. If `hour`/`minute` are
@@ -1842,6 +2258,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Electron apps -> AXError -25212). This is the start of porting the
         // extension's broader command set (paste, etc.) to those apps.
         if executeVoiceCommand(phrase) {
+            if !phrase.lowercased().hasPrefix("capture") {
+                lastCommandHeard = phrase
+            }
             return
         }
 
