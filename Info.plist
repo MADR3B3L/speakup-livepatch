@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>SpeakUp</string>
+    <key>CFBundleDisplayName</key>
+    <string>SpeakUp PoC</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.speakup.poc</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>SpeakUp</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SpeakUp uses the microphone to capture your speech and turn it into text edits in the app you're using.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>SpeakUp uses on-device/Apple speech recognition to transcribe what you say into text edits in the app you're using.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>

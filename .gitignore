@@ -1,0 +1,13 @@
+# Built app — rebuilt via build.sh, not tracked
+SpeakUp.app/
+
+# Build artifacts
+.build/
+
+# macOS
+.DS_Store
+*.swp
+
+# Log file lives at ~/speakup-poc-log.txt (outside project) — listed here
+# as a reminder in case it ever moves
+speakup-poc-log.txt
