@@ -1421,6 +1421,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
+            // "mac run <package>" — execute a named script from ~/Documents/SpeakUp/packages/
+            // Phrase words become the filename: "mac run rebuild speakup" → rebuild-speakup.sh
+            if rest2.hasPrefix("run "), rest2.count > "run ".count {
+                let packageName = String(rest2.dropFirst("run ".count))
+                    .trimmingCharacters(in: .whitespaces)
+                    .lowercased()
+                    .components(separatedBy: .whitespaces).joined(separator: "-")
+                let packagesDir = NSHomeDirectory() + "/Documents/SpeakUp/packages"
+                let scriptPath = packagesDir + "/" + packageName + ".sh"
+                if FileManager.default.fileExists(atPath: scriptPath) {
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+                    proc.arguments = [scriptPath]
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> running package \"\(packageName)\"")
+                    do {
+                        try proc.run()
+                        notify("SpeakUp running: \(packageName)", nil)
+                    } catch {
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> package failed: \(error)")
+                        notify("Package failed: \(packageName)", error.localizedDescription)
+                    }
+                } else {
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> package \"\(packageName)\" not found")
+                    notify("No package: \(packageName)", "Add \(packageName).sh to ~/Documents/SpeakUp/packages/")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac list packages" — show available packages
+            if rest2 == "list packages" || rest2 == "show packages" {
+                let packagesDir = NSHomeDirectory() + "/Documents/SpeakUp/packages"
+                let scripts = (try? FileManager.default.contentsOfDirectory(atPath: packagesDir))?
+                    .filter { $0.hasSuffix(".sh") }
+                    .map { $0.replacingOccurrences(of: ".sh", with: "") }
+                    .sorted() ?? []
+                if scripts.isEmpty {
+                    notify("SpeakUp packages", "None yet — add .sh files to ~/Documents/SpeakUp/packages/")
+                } else {
+                    notify("SpeakUp packages (\(scripts.count))", scripts.joined(separator: ", "))
+                }
+                appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packages: \(scripts.joined(separator: ", "))")
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
             // "mac show learned commands" — lists what auto-learn has added
             if rest2 == "show learned commands" || rest2 == "show learned" {
                 if userCommands.isEmpty {
