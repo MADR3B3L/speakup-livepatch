@@ -1437,6 +1437,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> running package \"\(packageName)\"")
                     do {
                         try proc.run()
+                        logPackageRun(packageName: packageName, trigger: phrase)
                         notify("SpeakUp running: \(packageName)", nil)
                     } catch {
                         appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> package failed: \(error)")
@@ -1518,6 +1519,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } catch {
                     appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> zip failed: \(error)")
                     notify("SpeakUp heard: \(phrase)", "Package reports failed")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac package alpha data" — full tester export: reports, learned cmds, log tail, metadata
+            if rest2 == "package alpha data" || rest2 == "package alpha" {
+                let scriptPath = NSHomeDirectory() + "/Documents/SpeakUp/packages/package-alpha-data.sh"
+                if FileManager.default.fileExists(atPath: scriptPath) {
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+                    proc.arguments = [scriptPath]
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packaging alpha data")
+                    do {
+                        try proc.run()
+                        logPackageRun(packageName: "package-alpha-data", trigger: phrase)
+                        notify("SpeakUp: packaging alpha data", "Bundle will appear on Desktop when ready")
+                    } catch {
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> alpha data package failed: \(error)")
+                        notify("Alpha data package failed", error.localizedDescription)
+                    }
+                } else {
+                    notify("SpeakUp: package script missing", "package-alpha-data.sh not found in packages/")
                 }
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
@@ -1760,6 +1784,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let escaped = appleScriptEscape(text)
         let script = "tell application \"Notes\" to make new note at folder \"Notes\" with properties {body:\"\(escaped)\"}"
         runShellCommand(script, label: "Capture note: \"\(text)\"")
+    }
+
+    /// Appends a line to ~/Documents/SpeakUp/package-runs.log every time a package executes.
+    private func logPackageRun(packageName: String, trigger: String) {
+        let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/package-runs.log")
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let line = "\(iso.string(from: Date()))\t\(packageName)\t\"\(trigger)\"\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                if let fh = try? FileHandle(forWritingTo: logURL) {
+                    fh.seekToEndOfFile()
+                    fh.write(data)
+                    fh.closeFile()
+                }
+            } else {
+                try? data.write(to: logURL, options: .atomic)
+            }
+        }
     }
 
     /// Appends a structured report entry to ~/Documents/SpeakUp/reports/speakup-reports.jsonl.
