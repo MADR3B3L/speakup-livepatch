@@ -2,6 +2,18 @@ import Cocoa
 import CoreGraphics
 import Speech
 
+/// Build profile embedded via ~/Documents/SpeakUp/alpha-config.json.
+/// If no config file exists the app treats itself as SpeakUpInternal (dev build, no restrictions).
+struct AlphaConfig {
+    let alphaId: String       // e.g. "LVP-ALPHA-ROBBY-20260617"
+    let testerLabel: String   // e.g. "robby"
+    let buildProfile: String  // "SpeakUpInternal" | "LivePatchPrivateAlpha"
+    let issuedDate: String
+    let expiresDate: String?  // ISO date string or nil = no expiry
+
+    var isPrivateAlpha: Bool { buildProfile == "LivePatchPrivateAlpha" }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var lastInspectionSummary: String = "No inspection run yet. Press ⌃⌥⌘I while focused in a text field."
@@ -22,6 +34,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var userCommands: [String: CommandSpec] = [:]
     private let userCommandsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/user-commands.json")
     private var userCommandsWatcher: DispatchSourceFileSystemObject?
+    private var alphaConfig: AlphaConfig? = nil
+    private var alphaExpired = false
+    private let alphaConfigURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/alpha-config.json")
 
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
@@ -106,6 +121,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logPermissionStatus()
         loadUserCommands()
         installUserCommandsWatcher()
+        loadAlphaConfig()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -151,6 +167,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let axTrusted = AccessibilityInspector.isTrusted(promptIfNeeded: false)
         appendLog("Accessibility trusted: \(axTrusted)")
         appendLog("Microphone status: \(MicrophonePermission.statusDescription())")
+    }
+
+    // MARK: - Alpha Config
+
+    private func loadAlphaConfig() {
+        guard let data = try? Data(contentsOf: alphaConfigURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let alphaId = json["alpha_id"] as? String,
+              let profile = json["build_profile"] as? String else {
+            appendLog("[Alpha] No alpha-config.json — running as SpeakUpInternal (dev build)")
+            return
+        }
+        let expires = json["expires_date"] as? String
+        let config = AlphaConfig(
+            alphaId: alphaId,
+            testerLabel: json["tester_label"] as? String ?? "unknown",
+            buildProfile: profile,
+            issuedDate: json["issued_date"] as? String ?? "",
+            expiresDate: expires
+        )
+        alphaConfig = config
+        appendLog("[Alpha] Profile: \(profile) | ID: \(alphaId) | Tester: \(config.testerLabel)")
+
+        // Update first menu item to reflect profile
+        DispatchQueue.main.async { [weak self] in
+            self?.statusItem.menu?.item(at: 0)?.title = "LivePatch — \(profile)"
+        }
+
+        // Check expiry
+        guard let expiresStr = expires else {
+            appendLog("[Alpha] No expiry set")
+            return
+        }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        guard let expiryDate = fmt.date(from: expiresStr) else {
+            appendLog("[Alpha] Could not parse expires_date: \(expiresStr)")
+            return
+        }
+        let daysLeft = Int(expiryDate.timeIntervalSince(Date()) / 86400) + 1
+        if Date() > expiryDate {
+            alphaExpired = true
+            appendLog("[Alpha] BUILD EXPIRED: \(expiresStr) | \(alphaId)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.notify("LivePatch alpha expired", "Build \(alphaId) expired \(expiresStr). Contact Marty for a fresh build.")
+            }
+        } else {
+            appendLog("[Alpha] Expires \(expiresStr) — \(daysLeft) day(s) remaining")
+            if daysLeft <= 3 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    self?.notify("LivePatch alpha expiring soon", "This build expires in \(daysLeft) day(s) (\(expiresStr)). Request a fresh build from Marty.")
+                }
+            }
+        }
     }
 
     // MARK: - User Commands (dynamic, persisted in ~/Documents/SpeakUp/user-commands.json)
@@ -221,6 +292,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "shutdown", "restart", "reboot", "sleep", "log out", "sign out",
         "empty trash", "force close", "kill", "terminate",
         "clear", "clear all", "reset", "wipe",
+    ]
+
+    /// Packages that may run in LivePatchPrivateAlpha profile.
+    /// All others are blocked — testers do not get arbitrary shell execution.
+    private static let privateAlphaPackageAllowlist: Set<String> = [
+        "restart-speakup",
+        "open-logs",
+        "open-command-card",
+        "package-alpha-data",
+        "check-permissions",
     ]
 
     private func processReportForAutoLearn(logLines: [String]) {
@@ -1430,6 +1511,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     .components(separatedBy: .whitespaces).joined(separator: "-")
                 let packagesDir = NSHomeDirectory() + "/Documents/SpeakUp/packages"
                 let scriptPath = packagesDir + "/" + packageName + ".sh"
+                // PrivateAlpha: block packages not on the approved list
+                if let cfg = alphaConfig, cfg.isPrivateAlpha,
+                   !Self.privateAlphaPackageAllowlist.contains(packageName) {
+                    appendLog("[Alpha] Package \"\(packageName)\" blocked — not in PrivateAlpha allowlist")
+                    notify("Package not available", "'\(packageName)' is not enabled in LivePatch Private Alpha")
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
                 if FileManager.default.fileExists(atPath: scriptPath) {
                     let proc = Process()
                     proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -1911,6 +2000,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let v = lastCommandHeard { dict["last_command_heard"] = v }
         if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String { dict["app_version"] = v }
         if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String { dict["build_version"] = v }
+        if let cfg = alphaConfig {
+            dict["alpha_id"] = cfg.alphaId
+            dict["build_profile"] = cfg.buildProfile
+            dict["tester_label"] = cfg.testerLabel
+        }
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
               let jsonLine = String(data: jsonData, encoding: .utf8) else {
