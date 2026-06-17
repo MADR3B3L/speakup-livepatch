@@ -2,6 +2,17 @@ import Cocoa
 import CoreGraphics
 import Speech
 
+/// Temporary speech/work buffer — separate from the system clipboard.
+/// Holds one piece of text (with metadata) until explicitly replaced, cleared, or pasted.
+struct LivePatchBuffer {
+    var text: String
+    var createdAt: Date
+    var updatedAt: Date
+    var sourceApp: String?
+    var sourceWindow: String?
+    var actionCount: Int
+}
+
 /// Build profile embedded via ~/Documents/SpeakUp/alpha-config.json.
 /// If no config file exists the app treats itself as SpeakUpInternal (dev build, no restrictions).
 struct AlphaConfig {
@@ -37,6 +48,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var alphaConfig: AlphaConfig? = nil
     private var alphaExpired = false
     private let alphaConfigURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/alpha-config.json")
+    private var liveBuffer: LivePatchBuffer? = nil
+    private let bufferURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/buffer.json")
 
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
@@ -122,6 +135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loadUserCommands()
         installUserCommandsWatcher()
         loadAlphaConfig()
+        loadBufferFromDisk()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -220,6 +234,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                     self?.notify("LivePatch alpha expiring soon", "This build expires in \(daysLeft) day(s) (\(expiresStr)). Request a fresh build from Marty.")
                 }
+            }
+        }
+    }
+
+    // MARK: - LivePatch Buffer
+
+    private func loadBufferFromDisk() {
+        guard let data = try? Data(contentsOf: bufferURL),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = dict["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+        let iso = ISO8601DateFormatter()
+        liveBuffer = LivePatchBuffer(
+            text: text,
+            createdAt: (dict["created_at"] as? String).flatMap { iso.date(from: $0) } ?? Date(),
+            updatedAt: (dict["updated_at"] as? String).flatMap { iso.date(from: $0) } ?? Date(),
+            sourceApp: dict["source_app"] as? String,
+            sourceWindow: dict["source_window"] as? String,
+            actionCount: dict["action_count"] as? Int ?? 0
+        )
+        appendLog("[Buffer] Restored from disk: \"\(bufferPreview(text))\"")
+    }
+
+    private func saveBufferToDisk() {
+        if let buf = liveBuffer {
+            let iso = ISO8601DateFormatter()
+            var dict: [String: Any] = [
+                "text": buf.text,
+                "created_at": iso.string(from: buf.createdAt),
+                "updated_at": iso.string(from: buf.updatedAt),
+                "action_count": buf.actionCount,
+            ]
+            if let v = buf.sourceApp { dict["source_app"] = v }
+            if let v = buf.sourceWindow { dict["source_window"] = v }
+            try? FileManager.default.createDirectory(at: bufferURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+                try? data.write(to: bufferURL)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: bufferURL)
+        }
+    }
+
+    /// Returns up to maxLen chars of text for use in notifications and logs.
+    private func bufferPreview(_ text: String, maxLen: Int = 80) -> String {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count <= maxLen ? t : String(t.prefix(maxLen)) + "…"
+    }
+
+    /// Pastes `text` into the focused field without permanently replacing the system clipboard.
+    /// Saves the current clipboard string, pastes, then restores it after a short delay.
+    /// Only string content is saved/restored (rich types like images are not preserved — TODO).
+    private func safePasteText(_ text: String, thenSend: Bool = false, label: String) {
+        let pb = NSPasteboard.general
+        let previous = pb.string(forType: .string)
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        simulateKeyCombo(keyCode: KeyCode.v, flags: .maskCommand, label: "\(label) paste")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            if thenSend {
+                self?.simulateKeyCombo(keyCode: KeyCode.return, flags: .maskCommand, label: "\(label) send")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                pb.clearContents()
+                if let prev = previous { pb.setString(prev, forType: .string) }
             }
         }
     }
@@ -708,10 +787,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         phraseSettleWorkItem = workItem
         let partial = speechCapture.lastTranscript.lowercased()
-        let isReportCommand = partial.hasPrefix("report ") || partial.hasPrefix("mac report")
+        let isLongDictationCommand = partial.hasPrefix("report ") || partial.hasPrefix("mac report")
             || partial.hasPrefix("capture bug") || partial.hasPrefix("capture issue")
             || partial.hasPrefix("capture feedback")
-        let delay = isReportCommand ? phraseSettleDelay + 1.0 : phraseSettleDelay
+            || partial.hasPrefix("mac save this") || partial.hasPrefix("mac append this")
+        let delay = isLongDictationCommand ? phraseSettleDelay + 1.0 : phraseSettleDelay
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
@@ -1041,6 +1121,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         "enter": CommandSpec(keyCode: KeyCode.return, flags: [], label: "Return"),
         "return": CommandSpec(keyCode: KeyCode.return, flags: [], label: "Return"),
+        "send": CommandSpec(keyCode: KeyCode.return, flags: .maskCommand, label: "⌘↩ (send/submit)"),
+        "submit": CommandSpec(keyCode: KeyCode.return, flags: .maskCommand, label: "⌘↩ (submit)"),
         "escape": CommandSpec(keyCode: KeyCode.escape, flags: [], label: "Escape"),
         "cancel": CommandSpec(keyCode: KeyCode.escape, flags: [], label: "Escape"),
         "tab": CommandSpec(keyCode: KeyCode.tab, flags: [], label: "Tab"),
@@ -1553,6 +1635,116 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     notify("SpeakUp packages (\(scripts.count))", scripts.joined(separator: ", "))
                 }
                 appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packages: \(scripts.joined(separator: ", "))")
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // MARK: Buffer commands
+
+            // "mac save this: <text>" — replace buffer with spoken text
+            if rest2.hasPrefix("save this") {
+                var textPart = String(rest2.dropFirst("save this".count)).trimmingCharacters(in: .whitespaces)
+                if textPart.hasPrefix(":") { textPart = String(textPart.dropFirst()).trimmingCharacters(in: .whitespaces) }
+                guard !textPart.isEmpty else {
+                    notify("LivePatch buffer", "Nothing to save — speak text after 'save this'")
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
+                let now = Date()
+                liveBuffer = LivePatchBuffer(
+                    text: textPart,
+                    createdAt: now,
+                    updatedAt: now,
+                    sourceApp: lastExternalApp?.localizedName,
+                    sourceWindow: nil,
+                    actionCount: 0
+                )
+                saveBufferToDisk()
+                appendLog("[Buffer] saved \"\(bufferPreview(textPart))\"")
+                notify("LivePatch buffer saved", bufferPreview(textPart))
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac append this: <text>" — append to existing buffer (or create)
+            if rest2.hasPrefix("append this") {
+                var textPart = String(rest2.dropFirst("append this".count)).trimmingCharacters(in: .whitespaces)
+                if textPart.hasPrefix(":") { textPart = String(textPart.dropFirst()).trimmingCharacters(in: .whitespaces) }
+                guard !textPart.isEmpty else {
+                    notify("LivePatch buffer", "Nothing to append — speak text after 'append this'")
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
+                let now = Date()
+                if var buf = liveBuffer {
+                    buf.text += " " + textPart
+                    buf.updatedAt = now
+                    buf.actionCount += 1
+                    liveBuffer = buf
+                } else {
+                    liveBuffer = LivePatchBuffer(
+                        text: textPart,
+                        createdAt: now,
+                        updatedAt: now,
+                        sourceApp: lastExternalApp?.localizedName,
+                        sourceWindow: nil,
+                        actionCount: 0
+                    )
+                }
+                saveBufferToDisk()
+                appendLog("[Buffer] appended \"\(bufferPreview(textPart))\"")
+                notify("LivePatch buffer updated", bufferPreview(liveBuffer!.text))
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac show buffer" — preview current buffer in a notification
+            if rest2 == "show buffer" {
+                if let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    appendLog("[Buffer] shown")
+                    notify("LivePatch buffer", bufferPreview(buf.text))
+                } else {
+                    appendLog("[Buffer] shown (empty)")
+                    notify("LivePatch buffer is empty", "Say 'mac save this: <text>' to fill it")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac paste buffer" — safe paste into focused field, restore clipboard after
+            if rest2 == "paste buffer" {
+                guard let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    notify("LivePatch buffer is empty", "Nothing to paste")
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
+                safePasteText(buf.text, thenSend: false, label: "[Buffer] paste")
+                appendLog("[Buffer] pasted \"\(bufferPreview(buf.text))\"")
+                notify("LivePatch pasted buffer", bufferPreview(buf.text))
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac send buffer" — safe paste + ⌘↩ to submit
+            if rest2 == "send buffer" {
+                guard let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    notify("LivePatch buffer is empty", "Nothing to send")
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
+                safePasteText(buf.text, thenSend: true, label: "[Buffer] send")
+                appendLog("[Buffer] sent \"\(bufferPreview(buf.text))\"")
+                notify("LivePatch sent buffer", bufferPreview(buf.text))
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac clear buffer" — wipe buffer and remove from disk
+            if rest2 == "clear buffer" {
+                liveBuffer = nil
+                saveBufferToDisk()
+                appendLog("[Buffer] cleared")
+                notify("LivePatch buffer cleared", nil)
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
             }
