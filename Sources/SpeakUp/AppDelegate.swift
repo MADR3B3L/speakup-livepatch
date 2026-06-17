@@ -1468,6 +1468,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
+            // "mac sleep" — voice panic-off: turns live mode off immediately
+            if rest2 == "sleep" || rest2 == "stop listening" || rest2 == "go to sleep" {
+                if liveModeOn {
+                    toggleLiveMode()
+                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> live mode off (voice sleep)")
+                    notify("SpeakUp sleeping", "Double-tap ⌘ or menu to wake")
+                } else {
+                    notify("SpeakUp already off", "Double-tap ⌘ to wake")
+                }
+                return true
+            }
+
+            // "mac forget command <phrase>" — remove a learned command
+            if rest2.hasPrefix("forget command "), rest2.count > "forget command ".count {
+                let target = String(rest2.dropFirst("forget command ".count)).trimmingCharacters(in: .whitespaces)
+                if userCommands[target] != nil {
+                    var entries: [[String: Any]] = []
+                    if let data = try? Data(contentsOf: userCommandsURL),
+                       let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                        entries = existing.filter { $0["phrase"] as? String != target }
+                    }
+                    if let data = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) {
+                        try? data.write(to: userCommandsURL)
+                    }
+                    appendLog("[UserCommands] Forgot learned command: \"\(target)\"")
+                    notify("SpeakUp forgot: \"\(target)\"", "Removed from learned commands")
+                } else if Self.commands[target] != nil {
+                    notify("Can't forget: \"\(target)\"", "That's a built-in command — only learned commands can be removed")
+                    appendLog("[UserCommands] Forget rejected — \"\(target)\" is a core command")
+                } else {
+                    notify("Not found: \"\(target)\"", "No learned command with that phrase")
+                    appendLog("[UserCommands] Forget: \"\(target)\" not found in learned commands")
+                }
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
+            // "mac reload commands" — force-reload user-commands.json without restarting
+            if rest2 == "reload commands" || rest2 == "reload user commands" {
+                loadUserCommands()
+                let count = userCommands.count
+                appendLog("[UserCommands] Manual reload — \(count) command(s) loaded")
+                notify("SpeakUp commands reloaded", count == 0 ? "No learned commands yet" : "\(count) learned command(s) active")
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
             // "mac show learned commands" — lists what auto-learn has added
             if rest2 == "show learned commands" || rest2 == "show learned" {
                 if userCommands.isEmpty {
