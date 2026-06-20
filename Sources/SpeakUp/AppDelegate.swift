@@ -51,6 +51,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var liveBuffer: LivePatchBuffer? = nil
     private let bufferURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/buffer.json")
 
+    // Held-backspace state — active while "action backspace" is running.
+    private var backspaceHoldTimer: Timer?
+
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
     var isListening = false
@@ -682,7 +685,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatusIcon() {
-        if isListening {
+        let axTrusted = AXIsProcessTrusted()
+        if !axTrusted {
+            statusItem.button?.title = "⚠️"
+        } else if isListening {
             statusItem.button?.title = "🔴"
         } else if liveModeOn {
             statusItem.button?.title = "🟢"
@@ -936,6 +942,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "select to bottom":     CommandSpec(keyCode: KeyCode.downArrow,   flags: [.maskShift, .maskCommand],        label: "⌘⇧↓ (select to bottom)"),
 
         // Deletion
+        "backspace":            CommandSpec(keyCode: KeyCode.delete,      flags: [],                                label: "⌫ (hold backspace)"),
         "delete word":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
         "delete word back":     CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
         "delete line":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskCommand,                      label: "⌘⌫ (delete to line start)"),
@@ -1344,6 +1351,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let inMediaMode = mediaModeUntil.map { $0 > Date() } ?? false
         let inDisplayMode = displayModeUntil.map { $0 > Date() } ?? false
 
+        // Stop held backspace if one is running
+        if backspaceHoldTimer != nil {
+            let stopWords: Set<String> = ["stop", "ok", "done", "cancel", "enough", "slash"]
+            if stopWords.contains(normalized) {
+                stopBackspaceHold()
+                return true
+            }
+        }
+
         // --- "direct" family ---
         // No prefix, no window check — "paste"/"undo"/"redo"/"clear"/
         // "cancel" always fire as-is. This is the experiment from the
@@ -1355,6 +1371,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             runCommandSpec(spec)
             commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
             notify("SpeakUp heard: \(phrase)", spec.label)
+            // Spoken feedback for direct commands
+            switch normalized {
+            case "paste", "undo", "redo", "clear": speak("Done")
+            default: break
+            }
             return true
         }
 
@@ -1662,6 +1683,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 saveBufferToDisk()
                 appendLog("[Buffer] saved \"\(bufferPreview(textPart))\"")
                 notify("LivePatch buffer saved", bufferPreview(textPart))
+                speak("Done")
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
             }
@@ -1694,6 +1716,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 saveBufferToDisk()
                 appendLog("[Buffer] appended \"\(bufferPreview(textPart))\"")
                 notify("LivePatch buffer updated", bufferPreview(liveBuffer!.text))
+                speak("Finished")
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
             }
@@ -1745,6 +1768,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 saveBufferToDisk()
                 appendLog("[Buffer] cleared")
                 notify("LivePatch buffer cleared", nil)
+                speak("Done")
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
             }
@@ -1810,6 +1834,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
+
             // "mac show reports" — opens the SpeakUp reports folder in Finder
             if rest2 == "show reports" {
                 let reportsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/reports")
@@ -1873,6 +1898,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
+            }
+
+            // "mac close <app>" / "mac quit <app>" — terminate a named running app
+            for closePrefix in ["close ", "quit ", "kill "] {
+                if rest2.hasPrefix(closePrefix), rest2.count > closePrefix.count {
+                    let target = String(rest2.dropFirst(closePrefix.count)).trimmingCharacters(in: .whitespaces)
+                    if let app = runningApp(named: target) {
+                        let name = app.localizedName ?? target
+                        app.terminate()
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> terminated \(name)")
+                        notify("Closed \(name)", nil)
+                    } else {
+                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> app not running: \(target)")
+                        notify("Not running: \"\(target)\"", "Nothing to close")
+                    }
+                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                    return true
+                }
             }
 
             var notifyBody: String? = nil
@@ -2045,11 +2088,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let modeNote = triggeredByActionWord ? "" : " (bare word, command mode)"
         appendLog("[LivePatch] COMMAND: \"\(phrase)\"\(modeNote) -> simulating \(spec.label)")
-        runCommandSpec(spec)
+
+        // "backspace" — hold mode: repeats ⌫ every 80ms until stopped by voice or physical key
+        if rest == "backspace" {
+            startBackspaceHold()
+            commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+            notify("SpeakUp heard: \(phrase)", "⌫ holding — say stop/ok/done or press ⌫")
+            return true
+        }
+
+        // "select all" — small delay so focused field is ready
+        if rest == "select all" || rest == "select" || rest == "grab all" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                self.runCommandSpec(spec)
+            }
+        // "deselect" — try Escape first (works in more apps), then rightArrow
+        } else if rest == "deselect" || rest == "deselect all" || rest == "clear selection" {
+            simulateKeyCombo(keyCode: 53, flags: [], label: "⎋ (escape/deselect)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.runCommandSpec(spec)
+            }
+        } else {
+            runCommandSpec(spec)
+        }
         commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
         appendLog("[LivePatch] command mode active for the next \(Int(Self.commandModeWindow))s — bare command words will be recognized.")
         notify("SpeakUp heard: \(phrase)", spec.label)
         return true
+    }
+
+    private func startBackspaceHold() {
+        stopBackspaceHold()
+        speak("Holding")
+        backspaceHoldTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+            self?.simulateKeyCombo(keyCode: KeyCode.delete, flags: [], label: "⌫ (hold)")
+        }
+    }
+
+    private func stopBackspaceHold() {
+        guard backspaceHoldTimer != nil else { return }
+        backspaceHoldTimer?.invalidate()
+        backspaceHoldTimer = nil
+        speak("Done")
     }
 
     /// Dispatches a `CommandSpec` to whichever execution path it specifies —
@@ -2822,6 +2902,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notification.informativeText = body
         notification.soundName = nil
         NSUserNotificationCenter.default.deliver(notification)
+    }
+
+    /// Speak a short confirmation out loud — one or two words only.
+    /// Non-blocking: fires and forgets via `say` so it never stalls the main thread.
+    private func speak(_ text: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        proc.arguments = [text]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError  = FileHandle.nullDevice
+        try? proc.run()
     }
 }
 
