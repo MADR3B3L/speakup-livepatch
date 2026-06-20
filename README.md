@@ -1,45 +1,46 @@
-# SpeakUp / LivePatch
+# SpeakUp
 
-A native macOS proof-of-concept that lets your voice participate in active text
-entry — fixing typos, firing shortcuts, and arranging your workspace — without
-interrupting what you're doing.
+Voice control for macOS that gets out of your way.
 
-**Not a dictation app. Not an AI assistant.**  
-It's a voice layer that acts like a fast, invisible coworker sitting next to you.
+Say the fix. Keep typing.
+
+---
+
+## Why this exists
+
+I built this because I needed it.
+
+Typing with certain conditions means errors stack up faster than you can catch them. Switching to a mouse to fix them breaks flow. Dictation apps take over your screen and your workflow. None of that works when you're trying to actually get things done.
+
+SpeakUp is what I wanted: a voice layer that fits *around* your work, not on top of it. Not a dictation app. Not an AI assistant. Something closer to a fast, invisible coworker sitting next to you — one that fixes the typo, fires the shortcut, and gets back out of the way.
 
 ---
 
 ## What it does
 
-### Fix While Working
-Type normally. Say the correction. Keep typing.  
-SpeakUp hears what you just said, finds the closest match in the focused field,
-and patches it in-place — cursor restored, no interruption.
+**Fix while you type**
+Type normally. Say the correction. Keep typing.
+SpeakUp hears what you said, finds the closest match in the focused field, and patches it in-place — cursor restored, no interruption.
 
-### Control Without Leaving
-Say `paste`, `undo`, `clear`, `action next tab`, `media volume up`,
-`display brightness down` — keyboard shortcuts fire without touching the keyboard
-or switching focus.
+**Control without leaving**
+Say `paste`, `undo`, `clear`, `action next tab`, `media volume up` — shortcuts fire without touching the keyboard or losing focus.
 
-### Prepare
-Say `mac prepare Gmail` or `mac prepare Notes`.  
-The app opens in the background. Nothing steals your focus.  
+**Prepare without interrupting**
+Say `mac prepare Gmail`. It opens in the background. Nothing steals your focus.
 Say `mac show me Gmail` when you're ready for it.
 
-### Parallel Work
-Say `mac work with Chrome`.  
-Your current app snaps left. Chrome snaps right.  
-Say `mac focus` to toggle between them.  
-Say `mac put away Chrome` to hide it and return to your work.
+**Side-by-side without the drag**
+Say `mac work with Chrome`. Your current app snaps left, Chrome snaps right.
+Say `mac focus` to toggle between them. Say `mac put away Chrome` to return to your work.
 
 ---
 
 ## Requirements
 
 - macOS 12+ (Monterey or later)
-- Xcode Command Line Tools (`xcode-select --install`)
-- **Accessibility permission** — required for reading/writing text fields
-- **Microphone + Speech Recognition permission** — required for voice input
+- Xcode Command Line Tools: `xcode-select --install`
+- Accessibility permission — required for reading and writing text fields
+- Microphone + Speech Recognition permission
 
 ---
 
@@ -51,38 +52,37 @@ cd speakup-poc
 open SpeakUp.app
 ```
 
-On first launch, click the 🎙 menu bar icon → **Check Permissions** and grant
-Accessibility + Microphone in System Settings.
+First launch: click the 🎙 menu bar icon → **Check Permissions** → grant Accessibility and Microphone in System Settings.
 
-> **Note:** The app is ad-hoc signed (no Apple Developer cert). macOS resets
-> Accessibility trust on every rebuild — after each `./build.sh`, click
-> the menu icon → **Check Permissions** → **Reinstall Hotkey Monitor**.
+> The app is ad-hoc signed (no Apple Developer cert). macOS resets Accessibility trust on every rebuild — after each `./build.sh`, open System Settings → Privacy & Security → Accessibility, remove SpeakUp and re-add it.
 
 ---
 
 ## Activation
 
-- **Double-tap Right-⌘** — toggle Live Mode on/off  
-- **Double-tap Right-⌘ then hold** — push-to-talk (listens while held, commits on release)
+- **Double-tap Right-⌘** — toggle listening on/off
+- **Double-tap Right-⌘ then hold** — push-to-talk (commits on release)
 
 ---
 
-## Voice Command Reference
+## Command Reference
 
 | Say | What happens |
 |---|---|
-| `paste` / `undo` / `redo` / `clear` / `cancel` | Fires instantly, no prefix |
-| `action <command>` | Editing/app shortcuts (select all, copy, close, next tab…) |
-| `media play` / `volume up` / `mute` / `brightness down` | System media/brightness keys |
-| `display brightness down` / `display lock` / `display sleep` | Screen controls |
-| `capture note <text>` / `capture reminder <text>` | Saves to Notes / Reminders |
-| `mac prepare <target>` | Background launch, no focus stolen |
-| `mac show me <target>` | Bring target to front |
-| `mac work with <target>` | Split screen: current left, target right |
+| `paste` / `undo` / `redo` / `clear` | Fires instantly, no prefix needed |
+| `action <command>` | Editing and app shortcuts (copy, close, next tab, bold…) |
+| `action backspace` | Holds ⌫ at a steady pace — say *stop* or *ok* to release |
+| `action delete word` | ⌥⌫ — deletes one word back |
+| `action delete line` | ⌘⌫ — deletes to start of line |
+| `media play` / `volume up` / `mute` | Media and volume keys |
+| `display brightness down` / `display lock` | Screen controls |
+| `mac prepare <app or site>` | Background open, no focus stolen |
+| `mac show me <app or site>` | Bring to front |
+| `mac work with <app>` | Split screen — current left, target right |
 | `mac focus` | Toggle between split panes |
-| `mac put away <target>` | Hide target, return to work |
-| `mac remind me 9:35 to <task>` | Timed Reminders entry |
-| `mac search for <query>` | Google search, opens in background |
+| `mac put away <app>` | Hide target, return to work |
+| `mac search for <query>` | Search in background |
+| `capture note <text>` / `capture reminder <text>` | Save to Notes or Reminders |
 
 ---
 
@@ -91,14 +91,14 @@ Accessibility + Microphone in System Settings.
 ```
 speakup-poc/
 ├── Sources/SpeakUp/
-│   ├── AppDelegate.swift          # Command dispatch, voice families, workspace control
-│   ├── SpeechCapture.swift        # Microphone capture + SFSpeechRecognizer pipeline
-│   ├── CandidateEngine.swift      # Similarity matching for live typo correction
-│   ├── AccessibilityInspector.swift  # AX field read/write via AXUIElement
-│   ├── MicrophonePermission.swift # Permission helpers
-│   └── main.swift                 # Entry point
-├── Info.plist                     # App metadata + entitlements
-├── build.sh                       # One-command build + ad-hoc sign
+│   ├── AppDelegate.swift            # Command dispatch, voice families, workspace control
+│   ├── SpeechCapture.swift          # Microphone + SFSpeechRecognizer pipeline
+│   ├── CandidateEngine.swift        # Similarity matching for typo correction
+│   ├── AccessibilityInspector.swift # AX field read/write via AXUIElement
+│   ├── MicrophonePermission.swift   # Permission helpers
+│   └── main.swift                   # Entry point
+├── Info.plist
+├── build.sh
 └── README.md
 ```
 
@@ -106,9 +106,25 @@ speakup-poc/
 
 ## Status
 
-Active proof-of-concept. All 4 demo stories working end-to-end on real voice
-input. Not yet distributed — pending proper code signing and packaging.
+Working proof-of-concept. All core features run end-to-end on real voice input.
+Not yet distributed — pending proper code signing and packaging.
+
+This is the open core. A learning layer that adapts to your specific voice patterns and fixes your particular errors is in private development.
+
+**Early access waitlist → [speakup.app](https://speakup.app)**
 
 ---
 
-*SpeakUp / LivePatch — Marty Angel Diaz Jr — 2026*
+## License
+
+MIT — see LICENSE
+
+---
+
+## Contributing
+
+Issues and PRs welcome. If you use SpeakUp for accessibility or assistive technology purposes, I especially want to hear from you.
+
+---
+
+*Built by Marty Angel Diaz Jr · 2026*
