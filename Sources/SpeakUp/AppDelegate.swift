@@ -2,29 +2,6 @@ import Cocoa
 import CoreGraphics
 import Speech
 
-/// Temporary speech/work buffer — separate from the system clipboard.
-/// Holds one piece of text (with metadata) until explicitly replaced, cleared, or pasted.
-struct LivePatchBuffer {
-    var text: String
-    var createdAt: Date
-    var updatedAt: Date
-    var sourceApp: String?
-    var sourceWindow: String?
-    var actionCount: Int
-}
-
-/// Build profile embedded via ~/Documents/SpeakUp/alpha-config.json.
-/// If no config file exists the app treats itself as SpeakUpInternal (dev build, no restrictions).
-struct AlphaConfig {
-    let alphaId: String       // e.g. "LVP-ALPHA-ROBBY-20260617"
-    let testerLabel: String   // e.g. "robby"
-    let buildProfile: String  // "SpeakUpInternal" | "LivePatchPrivateAlpha"
-    let issuedDate: String
-    let expiresDate: String?  // ISO date string or nil = no expiry
-
-    var isPrivateAlpha: Bool { buildProfile == "LivePatchPrivateAlpha" }
-}
-
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var lastInspectionSummary: String = "No inspection run yet. Press ⌃⌥⌘I while focused in a text field."
@@ -43,13 +20,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/speakup-poc-log.txt")
     var lastCommandHeard: String?
     private var userCommands: [String: CommandSpec] = [:]
-    private let userCommandsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/user-commands.json")
-    private var userCommandsWatcher: DispatchSourceFileSystemObject?
-    private var alphaConfig: AlphaConfig? = nil
-    private var alphaExpired = false
-    private let alphaConfigURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/alpha-config.json")
-    private var liveBuffer: LivePatchBuffer? = nil
-    private let bufferURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/buffer.json")
 
     // Held-backspace state — active while "action backspace" is running.
     private var backspaceHoldTimer: Timer?
@@ -135,10 +105,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         appendLog("=== SpeakUp PoC launched ===")
         logPermissionStatus()
-        loadUserCommands()
-        installUserCommandsWatcher()
-        loadAlphaConfig()
-        loadBufferFromDisk()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -186,229 +152,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appendLog("Microphone status: \(MicrophonePermission.statusDescription())")
     }
 
-    // MARK: - Alpha Config
 
-    private func loadAlphaConfig() {
-        guard let data = try? Data(contentsOf: alphaConfigURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let alphaId = json["alpha_id"] as? String,
-              let profile = json["build_profile"] as? String else {
-            appendLog("[Alpha] No alpha-config.json — running as SpeakUpInternal (dev build)")
-            return
-        }
-        let expires = json["expires_date"] as? String
-        let config = AlphaConfig(
-            alphaId: alphaId,
-            testerLabel: json["tester_label"] as? String ?? "unknown",
-            buildProfile: profile,
-            issuedDate: json["issued_date"] as? String ?? "",
-            expiresDate: expires
-        )
-        alphaConfig = config
-        appendLog("[Alpha] Profile: \(profile) | ID: \(alphaId) | Tester: \(config.testerLabel)")
 
-        // Update first menu item to reflect profile
-        DispatchQueue.main.async { [weak self] in
-            self?.statusItem.menu?.item(at: 0)?.title = "LivePatch — \(profile)"
-        }
-
-        // Check expiry
-        guard let expiresStr = expires else {
-            appendLog("[Alpha] No expiry set")
-            return
-        }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = TimeZone(identifier: "UTC")
-        guard let expiryDate = fmt.date(from: expiresStr) else {
-            appendLog("[Alpha] Could not parse expires_date: \(expiresStr)")
-            return
-        }
-        let daysLeft = Int(expiryDate.timeIntervalSince(Date()) / 86400) + 1
-        if Date() > expiryDate {
-            alphaExpired = true
-            appendLog("[Alpha] BUILD EXPIRED: \(expiresStr) | \(alphaId)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.notify("LivePatch alpha expired", "Build \(alphaId) expired \(expiresStr). Contact Marty for a fresh build.")
-            }
-        } else {
-            appendLog("[Alpha] Expires \(expiresStr) — \(daysLeft) day(s) remaining")
-            if daysLeft <= 3 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                    self?.notify("LivePatch alpha expiring soon", "This build expires in \(daysLeft) day(s) (\(expiresStr)). Request a fresh build from Marty.")
-                }
-            }
-        }
-    }
-
-    // MARK: - LivePatch Buffer
-
-    private func loadBufferFromDisk() {
-        guard let data = try? Data(contentsOf: bufferURL),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let text = dict["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return }
-        let iso = ISO8601DateFormatter()
-        liveBuffer = LivePatchBuffer(
-            text: text,
-            createdAt: (dict["created_at"] as? String).flatMap { iso.date(from: $0) } ?? Date(),
-            updatedAt: (dict["updated_at"] as? String).flatMap { iso.date(from: $0) } ?? Date(),
-            sourceApp: dict["source_app"] as? String,
-            sourceWindow: dict["source_window"] as? String,
-            actionCount: dict["action_count"] as? Int ?? 0
-        )
-        appendLog("[Buffer] Restored from disk: \"\(bufferPreview(text))\"")
-    }
-
-    private func saveBufferToDisk() {
-        if let buf = liveBuffer {
-            let iso = ISO8601DateFormatter()
-            var dict: [String: Any] = [
-                "text": buf.text,
-                "created_at": iso.string(from: buf.createdAt),
-                "updated_at": iso.string(from: buf.updatedAt),
-                "action_count": buf.actionCount,
-            ]
-            if let v = buf.sourceApp { dict["source_app"] = v }
-            if let v = buf.sourceWindow { dict["source_window"] = v }
-            try? FileManager.default.createDirectory(at: bufferURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-                try? data.write(to: bufferURL)
-            }
-        } else {
-            try? FileManager.default.removeItem(at: bufferURL)
-        }
-    }
-
-    /// Returns up to maxLen chars of text for use in notifications and logs.
-    private func bufferPreview(_ text: String, maxLen: Int = 80) -> String {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.count <= maxLen ? t : String(t.prefix(maxLen)) + "…"
-    }
-
-    /// Pastes `text` into the focused field without permanently replacing the system clipboard.
-    /// Saves the current clipboard string, pastes, then restores it after a short delay.
-    /// Only string content is saved/restored (rich types like images are not preserved — TODO).
-    private func safePasteText(_ text: String, thenSend: Bool = false, label: String) {
-        let pb = NSPasteboard.general
-        let previous = pb.string(forType: .string)
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        simulateKeyCombo(keyCode: KeyCode.v, flags: .maskCommand, label: "\(label) paste")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            if thenSend {
-                self?.simulateKeyCombo(keyCode: KeyCode.return, flags: .maskCommand, label: "\(label) send")
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                pb.clearContents()
-                if let prev = previous { pb.setString(prev, forType: .string) }
-            }
-        }
-    }
-
-    // MARK: - User Commands (dynamic, persisted in ~/Documents/SpeakUp/user-commands.json)
-
-    private func loadUserCommands() {
-        guard let data = try? Data(contentsOf: userCommandsURL),
-              let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            userCommands = [:]
-            return
-        }
-        var result: [String: CommandSpec] = [:]
-        for entry in entries {
-            guard let phrase = entry["phrase"] as? String,
-                  let keyCodeRaw = entry["keyCode"] as? Int,
-                  let flagsRaw = entry["flags"] as? UInt64,
-                  let label = entry["label"] as? String else { continue }
-            result[phrase] = CommandSpec(keyCode: CGKeyCode(keyCodeRaw), flags: CGEventFlags(rawValue: flagsRaw), label: label)
-        }
-        userCommands = result
-        if !result.isEmpty {
-            appendLog("[UserCommands] Loaded \(result.count) user-defined command(s): \(result.keys.sorted().joined(separator: ", "))")
-        }
-    }
-
-    private func addUserCommand(phrase: String, spec: CommandSpec) {
-        guard let keyCode = spec.keyCode else { return }
-        var entries: [[String: Any]] = []
-        if let data = try? Data(contentsOf: userCommandsURL),
-           let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            entries = existing.filter { $0["phrase"] as? String != phrase }
-        }
-        entries.append([
-            "phrase": phrase,
-            "keyCode": Int(keyCode),
-            "flags": spec.flags.rawValue,
-            "label": spec.label,
-        ])
-        try? FileManager.default.createDirectory(at: userCommandsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) {
-            try? data.write(to: userCommandsURL)
-        }
-    }
-
-    private func installUserCommandsWatcher() {
-        try? FileManager.default.createDirectory(at: userCommandsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: userCommandsURL.path) {
-            try? "[]".data(using: .utf8)?.write(to: userCommandsURL)
-        }
-        let fd = open(userCommandsURL.path, O_EVTONLY)
-        guard fd >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
-        source.setEventHandler { [weak self] in
-            self?.loadUserCommands()
-        }
-        source.setCancelHandler { close(fd) }
-        source.resume()
-        userCommandsWatcher = source
-    }
-
-    /// Called after every report save. Scans the captured log lines for
-    /// "isn't a recognized command", extracts the unknown phrase, and if it
-    /// exists in the reference dictionary adds it to user-commands.json
-    /// automatically — no rebuild, no manual step.
-    /// Commands that auto-learn must never touch. Destructive, system-level,
-    /// or high-risk phrases are blocked regardless of what the log says.
-    private static let autoLearnBlocklist: Set<String> = [
-        "quit", "force quit", "delete", "delete all", "format", "erase",
-        "shutdown", "restart", "reboot", "sleep", "log out", "sign out",
-        "empty trash", "force close", "kill", "terminate",
-        "clear", "clear all", "reset", "wipe",
-    ]
-
-    /// Packages that may run in LivePatchPrivateAlpha profile.
-    /// All others are blocked — testers do not get arbitrary shell execution.
-    private static let privateAlphaPackageAllowlist: Set<String> = [
-        "restart-speakup",
-        "open-logs",
-        "open-command-card",
-        "package-alpha-data",
-        "check-permissions",
-    ]
-
-    private func processReportForAutoLearn(logLines: [String]) {
-        for line in logLines {
-            guard line.contains("isn't a recognized command"),
-                  let butRange = line.range(of: "but \""),
-                  let isntRange = line.range(of: "\" isn't", range: butRange.upperBound..<line.endIndex) else { continue }
-            let phrase = String(line[butRange.upperBound..<isntRange.lowerBound]).lowercased()
-            guard !phrase.isEmpty,
-                  Self.commands[phrase] == nil,
-                  userCommands[phrase] == nil else { continue }
-            if Self.autoLearnBlocklist.contains(phrase) {
-                appendLog("[AutoLearn] \"\(phrase)\" is on the destructive blocklist — skipped")
-                continue
-            }
-            if let spec = Self.referenceCommands[phrase] {
-                addUserCommand(phrase: phrase, spec: spec)
-                userCommands[phrase] = spec
-                appendLog("[AutoLearn] \"\(phrase)\" → \(spec.label) — added to user-commands.json")
-                notify("SpeakUp learned: \"\(phrase)\"", spec.label)
-            } else {
-                appendLog("[AutoLearn] \"\(phrase)\" not in reference dict — skipped (not safe to invent)")
-            }
-        }
-    }
 
     // MARK: - Inspection
 
@@ -881,103 +626,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         static let end: CGKeyCode = 0x77
     }
 
-    /// Bundled map of natural-language words → key combos for auto-learn.
-    /// When a report flags an unrecognized command that exists here, SpeakUp
-    /// adds it to user-commands.json automatically — no rebuild needed.
-    private static let referenceCommands: [String: CommandSpec] = [
-        // Text formatting
-        "bold":                 CommandSpec(keyCode: KeyCode.b,            flags: .maskCommand,                      label: "⌘B (bold)"),
-        "italic":               CommandSpec(keyCode: KeyCode.i,            flags: .maskCommand,                      label: "⌘I (italic)"),
-        "italics":              CommandSpec(keyCode: KeyCode.i,            flags: .maskCommand,                      label: "⌘I (italic)"),
-        "underline":            CommandSpec(keyCode: KeyCode.u,            flags: .maskCommand,                      label: "⌘U (underline)"),
-        "comment":              CommandSpec(keyCode: KeyCode.slash,        flags: .maskCommand,                      label: "⌘/ (toggle comment)"),
-        "toggle comment":       CommandSpec(keyCode: KeyCode.slash,        flags: .maskCommand,                      label: "⌘/ (toggle comment)"),
-
-        // File
-        "save":                 CommandSpec(keyCode: KeyCode.s,            flags: .maskCommand,                      label: "⌘S (save)"),
-        "save as":              CommandSpec(keyCode: KeyCode.s,            flags: [.maskCommand, .maskShift],        label: "⌘⇧S (save as)"),
-        "print":                CommandSpec(keyCode: KeyCode.p,            flags: .maskCommand,                      label: "⌘P (print)"),
-        "open":                 CommandSpec(keyCode: KeyCode.o,            flags: .maskCommand,                      label: "⌘O (open)"),
-        "duplicate":            CommandSpec(keyCode: KeyCode.d,            flags: .maskCommand,                      label: "⌘D (duplicate)"),
-        "reload":               CommandSpec(keyCode: KeyCode.r,            flags: .maskCommand,                      label: "⌘R (reload)"),
-        "refresh":              CommandSpec(keyCode: KeyCode.r,            flags: .maskCommand,                      label: "⌘R (refresh)"),
-
-        // Word-level navigation
-        "word left":            CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskAlternate,                    label: "⌥← (word left)"),
-        "word back":            CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskAlternate,                    label: "⌥← (word back)"),
-        "word right":           CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskAlternate,                    label: "⌥→ (word right)"),
-        "word forward":         CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskAlternate,                    label: "⌥→ (word forward)"),
-
-        // Line-level navigation
-        "line start":           CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (line start)"),
-        "start of line":        CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (start of line)"),
-        "beginning of line":    CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskCommand,                      label: "⌘← (beginning of line)"),
-        "line end":             CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskCommand,                      label: "⌘→ (line end)"),
-        "end of line":          CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskCommand,                      label: "⌘→ (end of line)"),
-
-        // Document-level navigation
-        "go to top":            CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
-        "top of document":      CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
-        "document top":         CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskCommand,                      label: "⌘↑ (top)"),
-        "go to bottom":         CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
-        "bottom of document":   CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
-        "document bottom":      CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskCommand,                      label: "⌘↓ (bottom)"),
-        "page up":              CommandSpec(keyCode: KeyCode.pageUp,      flags: [],                                label: "Page Up"),
-        "page down":            CommandSpec(keyCode: KeyCode.pageDown,    flags: [],                                label: "Page Down"),
-        "scroll up":            CommandSpec(keyCode: KeyCode.pageUp,      flags: [],                                label: "Page Up"),
-        "scroll down":          CommandSpec(keyCode: KeyCode.pageDown,    flags: [],                                label: "Page Down"),
-        "home":                 CommandSpec(keyCode: KeyCode.home,        flags: [],                                label: "Home"),
-        "end":                  CommandSpec(keyCode: KeyCode.end,         flags: [],                                label: "End"),
-
-        // Selection extension
-        "select right":         CommandSpec(keyCode: KeyCode.rightArrow,  flags: .maskShift,                        label: "⇧→ (select right)"),
-        "select left":          CommandSpec(keyCode: KeyCode.leftArrow,   flags: .maskShift,                        label: "⇧← (select left)"),
-        "select up":            CommandSpec(keyCode: KeyCode.upArrow,     flags: .maskShift,                        label: "⇧↑ (select up)"),
-        "select down":          CommandSpec(keyCode: KeyCode.downArrow,   flags: .maskShift,                        label: "⇧↓ (select down)"),
-        "select word right":    CommandSpec(keyCode: KeyCode.rightArrow,  flags: [.maskShift, .maskAlternate],      label: "⌥⇧→ (select word right)"),
-        "select word left":     CommandSpec(keyCode: KeyCode.leftArrow,   flags: [.maskShift, .maskAlternate],      label: "⌥⇧← (select word left)"),
-        "select to end":        CommandSpec(keyCode: KeyCode.rightArrow,  flags: [.maskShift, .maskCommand],        label: "⌘⇧→ (select to end of line)"),
-        "select to start":      CommandSpec(keyCode: KeyCode.leftArrow,   flags: [.maskShift, .maskCommand],        label: "⌘⇧← (select to start of line)"),
-        "select to top":        CommandSpec(keyCode: KeyCode.upArrow,     flags: [.maskShift, .maskCommand],        label: "⌘⇧↑ (select to top)"),
-        "select to bottom":     CommandSpec(keyCode: KeyCode.downArrow,   flags: [.maskShift, .maskCommand],        label: "⌘⇧↓ (select to bottom)"),
-
-        // Deletion
-        "backspace":            CommandSpec(keyCode: KeyCode.delete,      flags: [],                                label: "⌫ (hold backspace)"),
-        "delete word":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
-        "delete word back":     CommandSpec(keyCode: KeyCode.delete,      flags: .maskAlternate,                    label: "⌥⌫ (delete word)"),
-        "delete line":          CommandSpec(keyCode: KeyCode.delete,      flags: .maskCommand,                      label: "⌘⌫ (delete to line start)"),
-        "forward delete":       CommandSpec(keyCode: KeyCode.forwardDelete, flags: [],                              label: "⌦ (forward delete)"),
-        "delete forward":       CommandSpec(keyCode: KeyCode.forwardDelete, flags: [],                              label: "⌦ (forward delete)"),
-
-        // Window / app
-        "minimize":             CommandSpec(keyCode: KeyCode.m,           flags: .maskCommand,                      label: "⌘M (minimize)"),
-        "hide":                 CommandSpec(keyCode: KeyCode.h,           flags: .maskCommand,                      label: "⌘H (hide)"),
-        "full screen":          CommandSpec(keyCode: KeyCode.f,           flags: [.maskCommand, .maskControl],      label: "⌃⌘F (full screen)"),
-        "zoom window":          CommandSpec(keyCode: KeyCode.f,           flags: [.maskCommand, .maskControl],      label: "⌃⌘F (full screen)"),
-        "zoom in":              CommandSpec(keyCode: KeyCode.equals,      flags: .maskCommand,                      label: "⌘= (zoom in)"),
-        "zoom out":             CommandSpec(keyCode: KeyCode.minus,       flags: .maskCommand,                      label: "⌘- (zoom out)"),
-        "actual size":          CommandSpec(keyCode: KeyCode.zero,        flags: .maskCommand,                      label: "⌘0 (actual size)"),
-        "reset zoom":           CommandSpec(keyCode: KeyCode.zero,        flags: .maskCommand,                      label: "⌘0 (reset zoom)"),
-
-        // Browser
-        "back":                 CommandSpec(keyCode: KeyCode.leftBracket, flags: .maskCommand,                      label: "⌘[ (back)"),
-        "go back":              CommandSpec(keyCode: KeyCode.leftBracket, flags: .maskCommand,                      label: "⌘[ (go back)"),
-        "forward":              CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (forward)"),
-        "go forward":           CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (go forward)"),
-
-        // Code
-        "indent":               CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand,                     label: "⌘] (indent)"),
-        "outdent":              CommandSpec(keyCode: KeyCode.leftBracket,  flags: .maskCommand,                     label: "⌘[ (outdent)"),
-        "unindent":             CommandSpec(keyCode: KeyCode.leftBracket,  flags: .maskCommand,                     label: "⌘[ (outdent)"),
-
-        // Screenshots
-        "screenshot":           CommandSpec(keyCode: KeyCode.three,       flags: [.maskCommand, .maskShift],        label: "⌘⇧3 (screenshot)"),
-        "screenshot area":      CommandSpec(keyCode: KeyCode.four,        flags: [.maskCommand, .maskShift],        label: "⌘⇧4 (screenshot area)"),
-
-        // Emoji / special characters
-        "emoji":                CommandSpec(keyCode: KeyCode.space,       flags: [.maskCommand, .maskControl],      label: "⌃⌘Space (emoji picker)"),
-        "special characters":   CommandSpec(keyCode: KeyCode.space,       flags: [.maskCommand, .maskControl],      label: "⌃⌘Space (special characters)"),
-    ]
 
     /// NX_KEYTYPE_* constants for the "media key" system-defined events
     /// (play/pause, next/previous track, volume, brightness, mute). These
@@ -1614,14 +1262,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     .components(separatedBy: .whitespaces).joined(separator: "-")
                 let packagesDir = NSHomeDirectory() + "/Documents/SpeakUp/packages"
                 let scriptPath = packagesDir + "/" + packageName + ".sh"
-                // PrivateAlpha: block packages not on the approved list
-                if let cfg = alphaConfig, cfg.isPrivateAlpha,
-                   !Self.privateAlphaPackageAllowlist.contains(packageName) {
-                    appendLog("[Alpha] Package \"\(packageName)\" blocked — not in PrivateAlpha allowlist")
-                    notify("Package not available", "'\(packageName)' is not enabled in LivePatch Private Alpha")
-                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                    return true
-                }
                 if FileManager.default.fileExists(atPath: scriptPath) {
                     let proc = Process()
                     proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -1660,118 +1300,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
-            // MARK: Buffer commands
-
-            // "mac save this: <text>" — replace buffer with spoken text
-            if rest2.hasPrefix("save this") {
-                var textPart = String(rest2.dropFirst("save this".count)).trimmingCharacters(in: .whitespaces)
-                if textPart.hasPrefix(":") { textPart = String(textPart.dropFirst()).trimmingCharacters(in: .whitespaces) }
-                guard !textPart.isEmpty else {
-                    notify("LivePatch buffer", "Nothing to save — speak text after 'save this'")
-                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                    return true
-                }
-                let now = Date()
-                liveBuffer = LivePatchBuffer(
-                    text: textPart,
-                    createdAt: now,
-                    updatedAt: now,
-                    sourceApp: lastExternalApp?.localizedName,
-                    sourceWindow: nil,
-                    actionCount: 0
-                )
-                saveBufferToDisk()
-                appendLog("[Buffer] saved \"\(bufferPreview(textPart))\"")
-                notify("LivePatch buffer saved", bufferPreview(textPart))
-                speak("Done")
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac append this: <text>" — append to existing buffer (or create)
-            if rest2.hasPrefix("append this") {
-                var textPart = String(rest2.dropFirst("append this".count)).trimmingCharacters(in: .whitespaces)
-                if textPart.hasPrefix(":") { textPart = String(textPart.dropFirst()).trimmingCharacters(in: .whitespaces) }
-                guard !textPart.isEmpty else {
-                    notify("LivePatch buffer", "Nothing to append — speak text after 'append this'")
-                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                    return true
-                }
-                let now = Date()
-                if var buf = liveBuffer {
-                    buf.text += " " + textPart
-                    buf.updatedAt = now
-                    buf.actionCount += 1
-                    liveBuffer = buf
-                } else {
-                    liveBuffer = LivePatchBuffer(
-                        text: textPart,
-                        createdAt: now,
-                        updatedAt: now,
-                        sourceApp: lastExternalApp?.localizedName,
-                        sourceWindow: nil,
-                        actionCount: 0
-                    )
-                }
-                saveBufferToDisk()
-                appendLog("[Buffer] appended \"\(bufferPreview(textPart))\"")
-                notify("LivePatch buffer updated", bufferPreview(liveBuffer!.text))
-                speak("Finished")
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac show buffer" — preview current buffer in a notification
-            if rest2 == "show buffer" {
-                if let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    appendLog("[Buffer] shown")
-                    notify("LivePatch buffer", bufferPreview(buf.text))
-                } else {
-                    appendLog("[Buffer] shown (empty)")
-                    notify("LivePatch buffer is empty", "Say 'mac save this: <text>' to fill it")
-                }
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac paste buffer" — safe paste into focused field, restore clipboard after
-            if rest2 == "paste buffer" {
-                guard let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    notify("LivePatch buffer is empty", "Nothing to paste")
-                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                    return true
-                }
-                safePasteText(buf.text, thenSend: false, label: "[Buffer] paste")
-                appendLog("[Buffer] pasted \"\(bufferPreview(buf.text))\"")
-                notify("LivePatch pasted buffer", bufferPreview(buf.text))
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac send buffer" — safe paste + ⌘↩ to submit
-            if rest2 == "send buffer" {
-                guard let buf = liveBuffer, !buf.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    notify("LivePatch buffer is empty", "Nothing to send")
-                    commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                    return true
-                }
-                safePasteText(buf.text, thenSend: true, label: "[Buffer] send")
-                appendLog("[Buffer] sent \"\(bufferPreview(buf.text))\"")
-                notify("LivePatch sent buffer", bufferPreview(buf.text))
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac clear buffer" — wipe buffer and remove from disk
-            if rest2 == "clear buffer" {
-                liveBuffer = nil
-                saveBufferToDisk()
-                appendLog("[Buffer] cleared")
-                notify("LivePatch buffer cleared", nil)
-                speak("Done")
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
 
             // "mac sleep" — voice panic-off: turns live mode off immediately
             if rest2 == "sleep" || rest2 == "stop listening" || rest2 == "go to sleep" {
@@ -1785,120 +1313,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return true
             }
 
-            // "mac forget command <phrase>" — remove a learned command
-            if rest2.hasPrefix("forget command "), rest2.count > "forget command ".count {
-                let target = String(rest2.dropFirst("forget command ".count)).trimmingCharacters(in: .whitespaces)
-                if userCommands[target] != nil {
-                    var entries: [[String: Any]] = []
-                    if let data = try? Data(contentsOf: userCommandsURL),
-                       let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                        entries = existing.filter { $0["phrase"] as? String != target }
-                    }
-                    if let data = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) {
-                        try? data.write(to: userCommandsURL)
-                    }
-                    appendLog("[UserCommands] Forgot learned command: \"\(target)\"")
-                    notify("SpeakUp forgot: \"\(target)\"", "Removed from learned commands")
-                } else if Self.commands[target] != nil {
-                    notify("Can't forget: \"\(target)\"", "That's a built-in command — only learned commands can be removed")
-                    appendLog("[UserCommands] Forget rejected — \"\(target)\" is a core command")
-                } else {
-                    notify("Not found: \"\(target)\"", "No learned command with that phrase")
-                    appendLog("[UserCommands] Forget: \"\(target)\" not found in learned commands")
-                }
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac reload commands" — force-reload user-commands.json without restarting
-            if rest2 == "reload commands" || rest2 == "reload user commands" {
-                loadUserCommands()
-                let count = userCommands.count
-                appendLog("[UserCommands] Manual reload — \(count) command(s) loaded")
-                notify("SpeakUp commands reloaded", count == 0 ? "No learned commands yet" : "\(count) learned command(s) active")
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac show learned commands" — lists what auto-learn has added
-            if rest2 == "show learned commands" || rest2 == "show learned" {
-                if userCommands.isEmpty {
-                    notify("SpeakUp learned commands", "None yet — report a failed command to teach me")
-                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> no learned commands yet")
-                } else {
-                    let list = userCommands.keys.sorted().joined(separator: ", ")
-                    notify("SpeakUp learned (\(userCommands.count))", list)
-                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> learned commands: \(list)")
-                }
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
 
 
-            // "mac show reports" — opens the SpeakUp reports folder in Finder
-            if rest2 == "show reports" {
-                let reportsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/reports")
-                try? FileManager.default.createDirectory(at: reportsURL, withIntermediateDirectories: true)
-                NSWorkspace.shared.open(reportsURL)
-                appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> opened reports folder in Finder")
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                notify("SpeakUp heard: \(phrase)", "Opened reports folder")
-                return true
-            }
-
-            // "mac package reports" — zips ~/Documents/SpeakUp/reports to Desktop
-            if rest2 == "package reports" {
-                let speakupDir = NSHomeDirectory() + "/Documents/SpeakUp"
-                let desktopPath = NSHomeDirectory() + "/Desktop"
-                let fmt = ISO8601DateFormatter()
-                fmt.formatOptions = [.withFullDate]
-                let zipName = "speakup-reports-\(fmt.string(from: Date())).zip"
-                let zipPath = desktopPath + "/" + zipName
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-                proc.arguments = ["-r", zipPath, "reports"]
-                proc.currentDirectoryURL = URL(fileURLWithPath: speakupDir)
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    if proc.terminationStatus == 0 {
-                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packaged reports to \(zipPath)")
-                        NSWorkspace.shared.selectFile(zipPath, inFileViewerRootedAtPath: desktopPath)
-                        notify("SpeakUp heard: \(phrase)", "Saved \(zipName) to Desktop")
-                    } else {
-                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> zip exited \(proc.terminationStatus) (no reports yet?)")
-                        notify("SpeakUp heard: \(phrase)", "Package failed — no reports yet?")
-                    }
-                } catch {
-                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> zip failed: \(error)")
-                    notify("SpeakUp heard: \(phrase)", "Package reports failed")
-                }
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
-
-            // "mac package alpha data" — full tester export: reports, learned cmds, log tail, metadata
-            if rest2 == "package alpha data" || rest2 == "package alpha" {
-                let scriptPath = NSHomeDirectory() + "/Documents/SpeakUp/packages/package-alpha-data.sh"
-                if FileManager.default.fileExists(atPath: scriptPath) {
-                    let proc = Process()
-                    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-                    proc.arguments = [scriptPath]
-                    appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> packaging alpha data")
-                    do {
-                        try proc.run()
-                        logPackageRun(packageName: "package-alpha-data", trigger: phrase)
-                        notify("SpeakUp: packaging alpha data", "Bundle will appear on Desktop when ready")
-                    } catch {
-                        appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> alpha data package failed: \(error)")
-                        notify("Alpha data package failed", error.localizedDescription)
-                    }
-                } else {
-                    notify("SpeakUp: package script missing", "package-alpha-data.sh not found in packages/")
-                }
-                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
-                return true
-            }
 
             // "mac close <app>" / "mac quit <app>" — terminate a named running app
             for closePrefix in ["close ", "quit ", "kill "] {
@@ -2165,7 +1581,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             captureNote("Idea: \(trimmed)")
-            saveReport(type: "idea", text: trimmed, phrase: phrase)
         case "reminder", "reminders", "task", "tasks", "todo":
             guard !trimmed.isEmpty else {
                 notify("SpeakUp heard: \(phrase)", "Nothing to capture")
@@ -2173,14 +1588,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             captureReminder(trimmed)
             notify("SpeakUp heard: \(phrase)", "Saved reminder: \"\(trimmed)\"")
-        case "bug", "bugs":
-            saveReport(type: "bug", text: trimmed, phrase: phrase)
-        case "issue", "issues":
-            saveReport(type: "issue", text: trimmed, phrase: phrase)
-        case "feedback":
-            saveReport(type: "feedback", text: trimmed, phrase: phrase)
-        case "report":
-            saveReport(type: "report", text: trimmed, phrase: phrase)
+        case "bug", "bugs", "issue", "issues", "feedback", "report":
+            appendLog("[SpeakUp] capture \(kind): \"\(trimmed)\"")
+            notify("SpeakUp heard: \(phrase)", "Captured \(kind): \"\(trimmed)\"")
         default:
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture kind \"\(kind)\" not recognized (try \"bug\", \"issue\", \"feedback\", \"note\", \"reminder\", or \"idea\") — ignored")
             notify("SpeakUp heard: \(phrase)", "Capture type \"\(kind)\" not recognized")
@@ -2215,103 +1625,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Appends a structured report entry to ~/Documents/SpeakUp/reports/speakup-reports.jsonl.
     /// Captures app context, AX/Speech permission state, and the last 10 log lines automatically.
-    private func saveReport(type reportType: String, text: String, phrase: String) {
-        let reportsDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/reports")
-        let reportsFile = reportsDir.appendingPathComponent("speakup-reports.jsonl")
-        try? FileManager.default.createDirectory(at: reportsDir, withIntermediateDirectories: true)
-
-        let id = UUID().uuidString
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-
-        // Frontmost app + window title via AX
-        let frontApp = lastExternalApp?.localizedName
-        var windowTitle: String? = nil
-        if let app = lastExternalApp {
-            let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            var winRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
-               let win = winRef {
-                var titleRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success {
-                    windowTitle = titleRef as? String
-                }
-            }
-        }
-
-        // Permission state snapshot
-        let axTrusted = AXIsProcessTrusted()
-        let speechAuth: String
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized: speechAuth = "authorized"
-        case .denied: speechAuth = "denied"
-        case .restricted: speechAuth = "restricted"
-        case .notDetermined: speechAuth = "notDetermined"
-        @unknown default: speechAuth = "unknown"
-        }
-
-        // Last 10 log lines for context
-        var lastLogLines: [String] = []
-        if let data = try? Data(contentsOf: logURL),
-           let logText = String(data: data, encoding: .utf8) {
-            lastLogLines = Array(logText.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(10))
-        }
-
-        var dict: [String: Any] = [
-            "id": id,
-            "timestamp": timestamp,
-            "report_type": reportType,
-            "user_text": text,
-            "raw_transcript": phrase,
-            "live_mode_state": liveModeOn ? "on" : "off",
-            "accessibility_trusted": axTrusted,
-            "speech_authorized": speechAuth,
-            "last_10_log_lines": lastLogLines,
-        ]
-        if let v = frontApp { dict["frontmost_app"] = v }
-        if let v = windowTitle { dict["frontmost_window_title"] = v }
-        if let v = lastCommandHeard { dict["last_command_heard"] = v }
-        if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String { dict["app_version"] = v }
-        if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String { dict["build_version"] = v }
-        if let cfg = alphaConfig {
-            dict["alpha_id"] = cfg.alphaId
-            dict["build_profile"] = cfg.buildProfile
-            dict["tester_label"] = cfg.testerLabel
-        }
-
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-              let jsonLine = String(data: jsonData, encoding: .utf8) else {
-            appendLog("[LivePatch] [Report] failed to serialize \(reportType) report")
-            return
-        }
-        let line = jsonLine + "\n"
-        if FileManager.default.fileExists(atPath: reportsFile.path) {
-            if let handle = try? FileHandle(forWritingTo: reportsFile),
-               let data = line.data(using: .utf8) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        } else {
-            try? line.data(using: .utf8)?.write(to: reportsFile)
-        }
-
-        let summary = String(text.prefix(60))
-        appendLog("[LivePatch] [Report] saved \(reportType): \(id) \"\(summary)\"")
-
-        // Auto-learn: scan the captured log lines for unrecognized commands
-        // and add them from the reference dictionary if possible.
-        processReportForAutoLearn(logLines: lastLogLines)
-
-        let notifTitle: String
-        switch reportType {
-        case "bug": notifTitle = "SpeakUp saved bug report"
-        case "issue": notifTitle = "SpeakUp saved issue"
-        case "feedback": notifTitle = "SpeakUp saved feedback"
-        case "idea": notifTitle = "SpeakUp saved idea"
-        default: notifTitle = "SpeakUp saved \(reportType)"
-        }
-        notify(notifTitle, "\"\(summary)\"")
-    }
 
     /// Creates a new Reminders item via osascript. If `hour`/`minute` are
     /// given ("Mac remind me 9:35 to record demo"), the reminder gets a due
