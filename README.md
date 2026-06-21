@@ -4,6 +4,14 @@ Voice control for macOS that gets out of your way.
 
 Say the fix. Keep typing.
 
+## Download
+
+**Want to use SpeakUp?** Download the latest release — it includes the ready-to-run app:
+
+**[Download SpeakUp Alpha (latest release)](https://github.com/MADR3B3L/speakup-livepatch/releases)**
+
+> Do not use "Code → Download ZIP" unless you are a developer building from source. That downloads raw Swift files, not the app.
+
 ---
 
 ## Why this exists
