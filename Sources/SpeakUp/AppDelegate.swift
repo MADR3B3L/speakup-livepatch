@@ -825,6 +825,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "document start": CommandSpec(keyCode: KeyCode.upArrow, flags: .maskCommand, label: "⌘↑ (document start)"),
         "document end": CommandSpec(keyCode: KeyCode.downArrow, flags: .maskCommand, label: "⌘↓ (document end)"),
         "delete word": CommandSpec(keyCode: KeyCode.delete, flags: .maskAlternate, label: "⌥⌫ (delete word)"),
+        "backspace": CommandSpec(keyCode: KeyCode.delete, flags: [], label: "⌫ (hold backspace)"),
 
         // --- System-level ---
         "screenshot": CommandSpec(keyCode: KeyCode.four, flags: [.maskCommand, .maskShift], label: "⇧⌘4 (screenshot)"),
