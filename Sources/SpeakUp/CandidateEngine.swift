@@ -81,9 +81,9 @@ enum CandidateEngine {
         }
         let firstOriginal = original[original.startIndex]
         if firstOriginal == Character(firstOriginal.uppercased()) {
-            return replacement.prefix(1).uppercased() + replacement.dropFirst()
+            return replacement.prefix(1).uppercased() + replacement.dropFirst().lowercased()
         }
-        return replacement
+        return replacement.lowercased()
     }
 
     /// Splits a heard phrase into words the same way the extension does
