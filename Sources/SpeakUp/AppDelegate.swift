@@ -59,7 +59,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var phraseSettleWorkItem: DispatchWorkItem?
     // Extension: AUTO_SETTLE_MS — let the user finish speaking before acting
     // on the transcript.
-    private let phraseSettleDelay: TimeInterval = 0.9
+    private let phraseSettleDelay: TimeInterval = 1.4
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Menu-bar-only app: no Dock icon, no app menu, doesn't steal focus.
