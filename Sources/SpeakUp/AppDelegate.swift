@@ -2189,6 +2189,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .failure(let msg):
             captureLog("AX_FAIL: \(msg)")
             appendLog("[LivePatch] could not read focused field: \(msg)")
+            let appName = lastExternalApp?.localizedName ?? "this app"
+            trackAppCorrection(app: appName, success: false)
+            // Notify user that correction doesn't work here — offer support path
+            let failKey = "ax_fail_\(appName)"
+            let failCount = (sessionStats[failKey] ?? 0) + 1
+            sessionStats[failKey] = failCount
+            if failCount == 1 {
+                notify("Voice corrections not available in \(appName)", "Commands still work. Say \"mac support\" to request \(appName) support.")
+            } else if failCount == 5 {
+                notify("\(appName) doesn't support text corrections yet", "Say \"mac support\" to send a report — we'll work on adding it.")
+            }
         case .success(let info):
             let nsValue = info.text as NSString
 
