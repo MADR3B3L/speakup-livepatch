@@ -2088,6 +2088,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Fuzzy command match: if the phrase is close to a known command,
+        // treat it as that command instead of a correction attempt.
+        let allCommandKeys = Array(Self.directCommands.keys) + Array(Self.commands.keys)
+        if let fuzzy = CandidateEngine.bestCommandMatch(for: phrase, in: allCommandKeys) {
+            appendLog("[LivePatch] FUZZY COMMAND: heard \"\(phrase)\" → matched \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
+            if executeVoiceCommand(fuzzy.command) {
+                lastCommandHeard = fuzzy.command
+                return
+            }
+        }
+
         guard wc <= CandidateEngine.speechMaxWords else {
             appendLog("[LivePatch] ignored \"\(phrase)\" (\(wc) words > \(CandidateEngine.speechMaxWords) — likely not a correction)")
             return

@@ -186,4 +186,20 @@ enum CandidateEngine {
         }
         return best.map { ($0.candidate, $0.similarity) }
     }
+
+    static let commandFuzzyFloor = 0.70
+
+    static func bestCommandMatch(for phrase: String, in commandKeys: [String]) -> (command: String, similarity: Double)? {
+        let lowerPhrase = phrase.lowercased()
+        var best: (command: String, similarity: Double)? = nil
+        for key in commandKeys {
+            let sim = similarity(lowerPhrase, key)
+            guard sim >= commandFuzzyFloor else { continue }
+            if lowerPhrase == key { return (key, 1.0) }
+            if best == nil || sim > best!.similarity {
+                best = (key, sim)
+            }
+        }
+        return best
+    }
 }
