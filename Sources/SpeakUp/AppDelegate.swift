@@ -31,9 +31,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureWindowStart: Date?
 
     // Adaptive corrections — pattern tracker + user-approved fixes.
-    // Key: what the speech recognizer hears. Value: (intended word, count of occurrences).
     private var mismatchTracker: [String: (intended: String, count: Int)] = [:]
     private var approvedCorrections: [String: String] = [:]
+
+    // Product intelligence — anonymous usage signals, no personal data.
+    private var sessionStats: [String: Int] = [
+        "commands_fired": 0,
+        "commands_fuzzy_matched": 0,
+        "commands_failed": 0,
+        "corrections_made": 0,
+        "corrections_low_confidence": 0,
+        "volume_gate_rejections": 0,
+        "captures_started": 0,
+        "adaptive_prompts_shown": 0,
+        "adaptive_approved": 0,
+        "adaptive_rejected": 0,
+    ]
+    private let statsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/usage-stats.json")
+    private var appCommandCounts: [String: [String: Int]] = [:]  // app -> command -> count
     private let approvedCorrectionsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/adaptive-corrections.json")
     private var pendingAdaptivePrompt: (heard: String, intended: String)? = nil
 
@@ -1337,6 +1352,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
 
+            // "mac support" / "mac technical support" — generate and save a support report
+            if rest2 == "support" || rest2 == "technical support" || rest2 == "help" {
+                sendTechnicalSupport()
+                commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
+                return true
+            }
+
             // "mac sleep" — voice panic-off: turns live mode off immediately
             if rest2 == "sleep" || rest2 == "stop listening" || rest2 == "go to sleep" {
                 if liveModeOn {
@@ -2111,7 +2133,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Volume gate: if the peak audio during this phrase was below the
         // threshold, it's probably ambient noise, not intentional speech.
         if !speechCapture.isAboveVolumeGate && speechCapture.sessionPeakPower < speechCapture.volumeGateThreshold {
-            appendLog("[LivePatch] VOLUME GATE: \"\(phrase)\" rejected — peak \(String(format: "%.1f", speechCapture.sessionPeakPower)) dB below threshold \(String(format: "%.1f", speechCapture.volumeGateThreshold)) dB")
+            trackStat("volume_gate_rejections"); appendLog("[LivePatch] VOLUME GATE: \"\(phrase)\" rejected — peak \(String(format: "%.1f", speechCapture.sessionPeakPower)) dB below threshold \(String(format: "%.1f", speechCapture.volumeGateThreshold)) dB")
             return
         }
 
@@ -2124,6 +2146,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // extension's broader command set (paste, etc.) to those apps.
         if executeVoiceCommand(phrase) {
             captureLog("CMD_OK: \"\(phrase)\"")
+            trackStat("commands_fired")
+            trackAppCommand(phrase.lowercased())
             if !phrase.lowercased().hasPrefix("capture") {
                 lastCommandHeard = phrase
             }
@@ -2134,7 +2158,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // treat it as that command instead of a correction attempt.
         let allCommandKeys = Array(Self.directCommands.keys) + Array(Self.commands.keys)
         if let fuzzy = CandidateEngine.bestCommandMatch(for: phrase, in: allCommandKeys) {
-            captureLog("FUZZY: \"\(phrase)\" → \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
+            trackStat("commands_fuzzy_matched"); captureLog("FUZZY: \"\(phrase)\" → \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
             appendLog("[LivePatch] FUZZY COMMAND: heard \"\(phrase)\" → matched \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
             if executeVoiceCommand(fuzzy.command) {
                 lastCommandHeard = fuzzy.command
@@ -2167,7 +2191,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let nsValue = info.text as NSString
 
             guard let match = CandidateEngine.bestMatch(in: nsValue, for: phrase, cursorLoc: info.cursorLoc) else {
-                appendLog("[LivePatch] LOW_CONFIDENCE: heard \"\(phrase)\" — no word in field cleared the similarity floor — no patch.")
+                trackStat("corrections_low_confidence"); appendLog("[LivePatch] LOW_CONFIDENCE: heard \"\(phrase)\" — no word in field cleared the similarity floor — no patch.")
                 return
             }
             let word = match.candidate.text
@@ -2351,7 +2375,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func promptAdaptiveCorrection(heard: String, intended: String) {
         pendingAdaptivePrompt = (heard, intended)
-        appendLog("[Adaptive] Prompting: \"\(heard)\" → \"\(intended)\" (3+ occurrences)")
+        trackStat("adaptive_prompts_shown"); appendLog("[Adaptive] Prompting: \"\(heard)\" → \"\(intended)\" (3+ occurrences)")
         notify("SpeakUp noticed a pattern", "You correct \"\(heard)\" to \"\(intended)\" often. Say \"yes\" or click to approve.")
     }
 
@@ -2360,13 +2384,86 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if approved {
             approvedCorrections[prompt.heard] = prompt.intended
             saveAdaptiveCorrections()
-            appendLog("[Adaptive] APPROVED: \"\(prompt.heard)\" → \"\(prompt.intended)\" — saved")
+            trackStat("adaptive_approved"); appendLog("[Adaptive] APPROVED: \"\(prompt.heard)\" → \"\(prompt.intended)\" — saved")
             notify("SpeakUp learned", "\"\(prompt.heard)\" will now auto-correct to \"\(prompt.intended)\"")
             speak("Learned")
         } else {
-            appendLog("[Adaptive] REJECTED: \"\(prompt.heard)\" → \"\(prompt.intended)\"")
+            trackStat("adaptive_rejected"); appendLog("[Adaptive] REJECTED: \"\(prompt.heard)\" → \"\(prompt.intended)\"")
         }
         pendingAdaptivePrompt = nil
+    }
+
+    // MARK: - Product Intelligence (anonymous usage signals)
+
+    func trackStat(_ key: String) {
+        sessionStats[key] = (sessionStats[key] ?? 0) + 1
+    }
+
+    func trackAppCommand(_ command: String) {
+        let app = lastExternalApp?.localizedName ?? "unknown"
+        if appCommandCounts[app] == nil { appCommandCounts[app] = [:] }
+        appCommandCounts[app]![command] = (appCommandCounts[app]![command] ?? 0) + 1
+    }
+
+    private func saveUsageStats() {
+        var stats: [String: Any] = sessionStats as [String: Any]
+        stats["app_command_usage"] = appCommandCounts
+        stats["total_adaptive_corrections"] = approvedCorrections.count
+        stats["session_end"] = ISO8601DateFormatter().string(from: Date())
+        try? FileManager.default.createDirectory(at: statsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: stats, options: [.prettyPrinted]) {
+            try? data.write(to: statsURL)
+        }
+        appendLog("[Stats] Session stats saved — \(sessionStats["commands_fired"] ?? 0) commands, \(sessionStats["corrections_made"] ?? 0) corrections")
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        saveUsageStats()
+    }
+
+    // MARK: - Technical Support (quick report submission)
+
+    private func sendTechnicalSupport() {
+        let statsData = try? Data(contentsOf: statsURL)
+        let statsText = statsData.flatMap { String(data: $0, encoding: .utf8) } ?? "no stats"
+
+        let capturesDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/captures")
+        let recentCaptures = (try? FileManager.default.contentsOfDirectory(atPath: capturesDir.path))?
+            .sorted().suffix(3).joined(separator: ", ") ?? "none"
+
+        let logLines: [String]
+        if let data = try? Data(contentsOf: logURL),
+           let logText = String(data: data, encoding: .utf8) {
+            logLines = Array(logText.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(20))
+        } else {
+            logLines = ["no log"]
+        }
+
+        let supportDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/support")
+        try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+
+        let id = UUID().uuidString.prefix(8)
+        let filename = "support-\(id).txt"
+        let fileURL = supportDir.appendingPathComponent(filename)
+
+        var content = "SpeakUp Technical Support Report\n"
+        content += "================================\n"
+        content += "Date: \(ISO8601DateFormatter().string(from: Date()))\n"
+        content += "App: \(lastExternalApp?.localizedName ?? "unknown")\n"
+        content += "LiveMode: \(liveModeOn ? "ON" : "OFF")\n\n"
+        content += "--- Recent Captures ---\n\(recentCaptures)\n\n"
+        content += "--- Last 20 Log Lines ---\n\(logLines.joined(separator: "\n"))\n\n"
+        content += "--- Session Stats ---\n\(statsText)\n\n"
+        content += "--- Adaptive Corrections ---\n\(approvedCorrections.count) approved\n"
+        for (heard, intended) in approvedCorrections {
+            content += "  \"\(heard)\" → \"\(intended)\"\n"
+        }
+
+        try? content.data(using: .utf8)?.write(to: fileURL)
+
+        notify("Support report saved", "~/Documents/SpeakUp/support/\(filename)\nEmail to martyadiaz@gmail.com")
+        speak("Support saved")
+        appendLog("[Support] Report saved: \(filename)")
     }
 
     // MARK: - Capture Window (live diagnostic recording)
@@ -2395,7 +2492,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         speak("Capturing")
         notify("Capture started", "Recording for 15 seconds. Use SpeakUp normally.")
-        appendLog("[Capture] Window opened — \(kind): \"\(description)\"")
+        trackStat("captures_started"); appendLog("[Capture] Window opened — \(kind): \"\(description)\"")
 
         captureWindowTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
             self?.endCaptureWindow(kind: kind, description: description)
