@@ -134,6 +134,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appendLog("=== SpeakUp PoC launched ===")
         logPermissionStatus()
         loadAdaptiveCorrections()
+        loadAppProfiles()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -143,6 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if app.bundleIdentifier != Bundle.main.bundleIdentifier {
             lastExternalApp = app
             appendLog("Active app changed -> \(app.localizedName ?? "?") (\(app.bundleIdentifier ?? "?"))")
+            trackAppEnvironment()
         }
     }
 
@@ -2419,6 +2421,66 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         saveUsageStats()
+        saveAppProfiles()
+    }
+
+    // MARK: - App Environment Profiles
+
+    private var appProfiles: [String: [String: Any]] = [:]
+    private let appProfilesURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/app-profiles.json")
+
+    func trackAppEnvironment() {
+        guard let app = lastExternalApp else { return }
+        let name = app.localizedName ?? "unknown"
+        let bundleId = app.bundleIdentifier ?? "unknown"
+
+        if appProfiles[name] == nil {
+            appProfiles[name] = [
+                "bundle_id": bundleId,
+                "first_seen": ISO8601DateFormatter().string(from: Date()),
+                "ax_supported": false,
+                "ax_tested": false,
+                "commands_used": [String: Int](),
+                "corrections_made": 0,
+                "corrections_failed": 0,
+            ]
+        }
+
+        // Test AX support if we haven't yet
+        if appProfiles[name]?["ax_tested"] as? Bool == false {
+            switch AccessibilityInspector.currentValueAndCursor(targetApp: lastExternalApp) {
+            case .success:
+                appProfiles[name]?["ax_supported"] = true
+                appProfiles[name]?["ax_tested"] = true
+                appendLog("[AppProfile] \(name): AX supported")
+            case .failure:
+                appProfiles[name]?["ax_supported"] = false
+                appProfiles[name]?["ax_tested"] = true
+                appendLog("[AppProfile] \(name): AX not supported — commands only, no corrections")
+            }
+        }
+    }
+
+    func trackAppCorrection(app: String, success: Bool) {
+        if success {
+            appProfiles[app]?["corrections_made"] = ((appProfiles[app]?["corrections_made"] as? Int) ?? 0) + 1
+        } else {
+            appProfiles[app]?["corrections_failed"] = ((appProfiles[app]?["corrections_failed"] as? Int) ?? 0) + 1
+        }
+    }
+
+    private func loadAppProfiles() {
+        guard let data = try? Data(contentsOf: appProfilesURL),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else { return }
+        appProfiles = dict
+        appendLog("[AppProfile] Loaded profiles for \(dict.count) app(s)")
+    }
+
+    private func saveAppProfiles() {
+        try? FileManager.default.createDirectory(at: appProfilesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: appProfiles, options: [.prettyPrinted]) {
+            try? data.write(to: appProfilesURL)
+        }
     }
 
     // MARK: - Technical Support (quick report submission)
@@ -2461,8 +2523,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         try? content.data(using: .utf8)?.write(to: fileURL)
 
-        notify("Support report saved", "~/Documents/SpeakUp/support/\(filename)\nEmail to martyadiaz@gmail.com")
-        speak("Support saved")
+        // Try to open Mail with a draft email and the report attached
+        let emailBody = appleScriptEscape("Hi SpeakUp support,\\n\\nPlease find my support report attached.\\n\\nThanks")
+        let filePath = appleScriptEscape(fileURL.path)
+        let mailScript = """
+        tell application "Mail"
+            set newMsg to make new outgoing message with properties {subject:"SpeakUp Support Report — \(id)", content:"\(emailBody)", visible:true}
+            tell newMsg
+                make new to recipient at end of to recipients with properties {address:"martyadiaz@gmail.com"}
+                tell content
+                    make new attachment with properties {file name:POSIX file "\(fileURL.path)"} at after the last paragraph
+                end tell
+            end tell
+            activate
+        end tell
+        """
+        let mailProc = Process()
+        mailProc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        mailProc.arguments = ["-e", mailScript]
+        mailProc.standardOutput = FileHandle.nullDevice
+        mailProc.standardError = FileHandle.nullDevice
+
+        do {
+            try mailProc.run()
+            mailProc.waitUntilExit()
+            if mailProc.terminationStatus == 0 {
+                notify("Support email drafted", "Mail opened with your report attached. Review and send.")
+                speak("Email ready")
+            } else {
+                // Mail failed — fall back to showing the file
+                NSWorkspace.shared.selectFile(fileURL.path, inFileViewerRootedAtPath: fileURL.deletingLastPathComponent().path)
+                notify("Support report saved", "Mail couldn't open. Report saved at:\n\(fileURL.path)\nEmail to martyadiaz@gmail.com")
+                speak("Support saved")
+            }
+        } catch {
+            NSWorkspace.shared.selectFile(fileURL.path, inFileViewerRootedAtPath: fileURL.deletingLastPathComponent().path)
+            notify("Support report saved", "Report saved. Email to martyadiaz@gmail.com")
+            speak("Support saved")
+        }
         appendLog("[Support] Report saved: \(filename)")
     }
 
