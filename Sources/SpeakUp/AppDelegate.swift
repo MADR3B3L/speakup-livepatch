@@ -541,8 +541,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let isLongDictationCommand = partial.hasPrefix("report ") || partial.hasPrefix("mac report")
             || partial.hasPrefix("capture bug") || partial.hasPrefix("capture issue")
             || partial.hasPrefix("capture feedback")
-            || partial.hasPrefix("mac save this") || partial.hasPrefix("mac append this")
-        let delay = isLongDictationCommand ? phraseSettleDelay + 1.0 : phraseSettleDelay
+        let isShortKnownCommand = Self.commands[partial] != nil
+            || partial == "paste" || partial == "undo" || partial == "redo" || partial == "clear"
+            || partial == "select all" || partial == "select" || partial == "copy"
+            || partial.hasPrefix("action ") && Self.commands[String(partial.dropFirst("action ".count))] != nil
+        let delay = isLongDictationCommand ? phraseSettleDelay + 1.0
+            : isShortKnownCommand ? 0.7
+            : phraseSettleDelay
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
