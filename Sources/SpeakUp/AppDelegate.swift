@@ -2265,6 +2265,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let result = AccessibilityInspector.replaceRange(range, with: replacement, expectedOriginal: word, targetApp: lastExternalApp)
             switch result {
             case .success(let detail):
+                trackStat("corrections_made")
+                trackAppCorrection(app: lastExternalApp?.localizedName ?? "unknown", success: true)
+                captureLog("CORRECTED: \"\(word)\" → \"\(replacement)\" (sim=\(String(format: "%.2f", sim)))")
                 appendLog("[LivePatch] WRITE SUCCESS: \(detail)")
                 if restoreCursor != range.location + replacementNS.length {
                     switch AccessibilityInspector.setCursor(restoreCursor, targetApp: lastExternalApp) {
@@ -2292,15 +2295,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Logging
 
+    private static let maxLogSize = 1_000_000 // 1 MB
+
     private func appendLog(_ line: String) {
         let stamped = "[SpeakUp] \(line)\n"
         print(stamped, terminator: "")
         if let data = stamped.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: logURL.path) {
+                // Rotate if over 1 MB
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+                   let size = attrs[.size] as? Int, size > Self.maxLogSize {
+                    let archiveURL = logURL.deletingPathExtension().appendingPathExtension("old.txt")
+                    try? FileManager.default.removeItem(at: archiveURL)
+                    try? FileManager.default.moveItem(at: logURL, to: archiveURL)
+                }
                 if let handle = try? FileHandle(forWritingTo: logURL) {
                     handle.seekToEndOfFile()
                     handle.write(data)
                     try? handle.close()
+                } else {
+                    try? data.write(to: logURL)
                 }
             } else {
                 try? data.write(to: logURL)
