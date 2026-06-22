@@ -30,6 +30,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureWindowLog: [String] = []
     private var captureWindowStart: Date?
 
+    // Adaptive corrections — pattern tracker + user-approved fixes.
+    // Key: what the speech recognizer hears. Value: (intended word, count of occurrences).
+    private var mismatchTracker: [String: (intended: String, count: Int)] = [:]
+    private var approvedCorrections: [String: String] = [:]
+    private let approvedCorrectionsURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/adaptive-corrections.json")
+    private var pendingAdaptivePrompt: (heard: String, intended: String)? = nil
+
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
     var isListening = false
@@ -111,6 +118,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         appendLog("=== SpeakUp PoC launched ===")
         logPermissionStatus()
+        loadAdaptiveCorrections()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -1010,6 +1018,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .trimmingCharacters(in: CharacterSet(charactersIn: ".!?"))
 
         let words = normalized.split(separator: " ").map(String.init)
+
+        // Adaptive prompt response — "yes"/"no" when a correction prompt is showing
+        if pendingAdaptivePrompt != nil {
+            if normalized == "yes" || normalized == "yeah" || normalized == "correct" || normalized == "approve" {
+                handleAdaptiveResponse(approved: true)
+                return true
+            }
+            if normalized == "no" || normalized == "nope" || normalized == "wrong" || normalized == "deny" {
+                handleAdaptiveResponse(approved: false)
+                return true
+            }
+        }
+
         let inCommandMode = commandModeUntil.map { $0 > Date() } ?? false
         let inMediaMode = mediaModeUntil.map { $0 > Date() } ?? false
         let inDisplayMode = displayModeUntil.map { $0 > Date() } ?? false
@@ -2129,6 +2150,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Check adaptive corrections first — user already approved this mapping
+        if let adaptiveReplacement = applyAdaptiveCorrection(for: phrase) {
+            appendLog("[Adaptive] AUTO-CORRECT: \"\(phrase)\" → \"\(adaptiveReplacement)\" (user-approved)")
+            captureLog("ADAPTIVE: \"\(phrase)\" → \"\(adaptiveReplacement)\"")
+            // Re-run with the corrected phrase
+            processLiveHeardPhrase(adaptiveReplacement)
+            return
+        }
+
         switch AccessibilityInspector.currentValueAndCursor(targetApp: lastExternalApp) {
         case .failure(let msg):
             captureLog("AX_FAIL: \(msg)")
@@ -2143,6 +2173,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let word = match.candidate.text
             let range = match.candidate.range
             let sim = match.similarity
+
+            // Track this correction for adaptive learning
+            trackMismatch(heard: phrase, correctedTo: word)
 
             // Re-snapshot the field right before writing. Between when this
             // phrase started settling (~phraseSettleDelay ago) and now, the
@@ -2272,6 +2305,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError  = FileHandle.nullDevice
         try? proc.run()
+    }
+
+    // MARK: - Adaptive Corrections (pattern tracking + user-approved fixes)
+
+    private func loadAdaptiveCorrections() {
+        guard let data = try? Data(contentsOf: approvedCorrectionsURL),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            approvedCorrections = [:]
+            return
+        }
+        approvedCorrections = dict
+        if !dict.isEmpty {
+            appendLog("[Adaptive] Loaded \(dict.count) approved correction(s)")
+        }
+    }
+
+    private func saveAdaptiveCorrections() {
+        try? FileManager.default.createDirectory(at: approvedCorrectionsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: approvedCorrections, options: [.prettyPrinted]) {
+            try? data.write(to: approvedCorrectionsURL)
+        }
+    }
+
+    func applyAdaptiveCorrection(for heard: String) -> String? {
+        return approvedCorrections[heard.lowercased()]
+    }
+
+    func trackMismatch(heard: String, correctedTo: String) {
+        let key = heard.lowercased()
+        let intended = correctedTo.lowercased()
+        guard key != intended else { return }
+        if approvedCorrections[key] != nil { return }
+
+        if let existing = mismatchTracker[key], existing.intended == intended {
+            mismatchTracker[key] = (intended, existing.count + 1)
+            if existing.count + 1 >= 3 {
+                promptAdaptiveCorrection(heard: key, intended: intended)
+                mismatchTracker.removeValue(forKey: key)
+            }
+        } else {
+            mismatchTracker[key] = (intended, 1)
+        }
+    }
+
+    private func promptAdaptiveCorrection(heard: String, intended: String) {
+        pendingAdaptivePrompt = (heard, intended)
+        appendLog("[Adaptive] Prompting: \"\(heard)\" → \"\(intended)\" (3+ occurrences)")
+        notify("SpeakUp noticed a pattern", "You correct \"\(heard)\" to \"\(intended)\" often. Say \"yes\" or click to approve.")
+    }
+
+    func handleAdaptiveResponse(approved: Bool) {
+        guard let prompt = pendingAdaptivePrompt else { return }
+        if approved {
+            approvedCorrections[prompt.heard] = prompt.intended
+            saveAdaptiveCorrections()
+            appendLog("[Adaptive] APPROVED: \"\(prompt.heard)\" → \"\(prompt.intended)\" — saved")
+            notify("SpeakUp learned", "\"\(prompt.heard)\" will now auto-correct to \"\(prompt.intended)\"")
+            speak("Learned")
+        } else {
+            appendLog("[Adaptive] REJECTED: \"\(prompt.heard)\" → \"\(prompt.intended)\"")
+        }
+        pendingAdaptivePrompt = nil
     }
 
     // MARK: - Capture Window (live diagnostic recording)
