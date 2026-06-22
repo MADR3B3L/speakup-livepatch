@@ -24,6 +24,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Held-backspace state — active while "action backspace" is running.
     private var backspaceHoldTimer: Timer?
 
+    // Capture window — active diagnostic recording session.
+    private var captureWindowActive = false
+    private var captureWindowTimer: Timer?
+    private var captureWindowLog: [String] = []
+    private var captureWindowStart: Date?
+
     // Milestone 2A: speech capture (log-only for now, no AX writes).
     let speechCapture = SpeechCapture()
     var isListening = false
@@ -1597,9 +1603,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             captureReminder(trimmed)
             notify("SpeakUp heard: \(phrase)", "Saved reminder: \"\(trimmed)\"")
-        case "bug", "bugs", "issue", "issues", "feedback", "report":
+        case "bug", "bugs", "issue", "issues":
+            if captureWindowActive {
+                notify("Capture already running", "Wait for it to finish")
+            } else {
+                startCaptureWindow(kind: kind, description: trimmed)
+            }
+        case "feedback", "report":
             appendLog("[SpeakUp] capture \(kind): \"\(trimmed)\" — LivePatch required for full reporting")
-            notify("LivePatch required", "Reports, auto-learning, and custom commands are LivePatch features. Visit madr3b3l.github.io/speakup-livepatch to upgrade.")
+            notify("LivePatch required", "Full reports, auto-learning, and custom commands are LivePatch features. Visit madr3b3l.github.io/speakup-livepatch to upgrade.")
             speak("LivePatch feature")
         default:
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture kind \"\(kind)\" not recognized (try \"bug\", \"issue\", \"feedback\", \"note\", \"reminder\", or \"idea\") — ignored")
@@ -2090,6 +2102,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Electron apps -> AXError -25212). This is the start of porting the
         // extension's broader command set (paste, etc.) to those apps.
         if executeVoiceCommand(phrase) {
+            captureLog("CMD_OK: \"\(phrase)\"")
             if !phrase.lowercased().hasPrefix("capture") {
                 lastCommandHeard = phrase
             }
@@ -2100,6 +2113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // treat it as that command instead of a correction attempt.
         let allCommandKeys = Array(Self.directCommands.keys) + Array(Self.commands.keys)
         if let fuzzy = CandidateEngine.bestCommandMatch(for: phrase, in: allCommandKeys) {
+            captureLog("FUZZY: \"\(phrase)\" → \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
             appendLog("[LivePatch] FUZZY COMMAND: heard \"\(phrase)\" → matched \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
             if executeVoiceCommand(fuzzy.command) {
                 lastCommandHeard = fuzzy.command
@@ -2107,13 +2121,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        captureLog("NOT_CMD: \"\(phrase)\" — trying correction")
+
         guard wc <= CandidateEngine.speechMaxWords else {
+            captureLog("TOO_LONG: \"\(phrase)\" (\(wc) words)")
             appendLog("[LivePatch] ignored \"\(phrase)\" (\(wc) words > \(CandidateEngine.speechMaxWords) — likely not a correction)")
             return
         }
 
         switch AccessibilityInspector.currentValueAndCursor(targetApp: lastExternalApp) {
         case .failure(let msg):
+            captureLog("AX_FAIL: \(msg)")
             appendLog("[LivePatch] could not read focused field: \(msg)")
         case .success(let info):
             let nsValue = info.text as NSString
@@ -2254,6 +2272,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError  = FileHandle.nullDevice
         try? proc.run()
+    }
+
+    // MARK: - Capture Window (live diagnostic recording)
+
+    func captureLog(_ entry: String) {
+        guard captureWindowActive else { return }
+        let ts = String(format: "%.2f", Date().timeIntervalSince(captureWindowStart ?? Date()))
+        captureWindowLog.append("[\(ts)s] \(entry)")
+    }
+
+    private func startCaptureWindow(kind: String, description: String) {
+        captureWindowActive = true
+        captureWindowStart = Date()
+        captureWindowLog = []
+        captureLog("CAPTURE START: \(kind) — \"\(description)\"")
+        captureLog("Active app: \(lastExternalApp?.localizedName ?? "unknown")")
+        captureLog("LiveMode: \(liveModeOn ? "ON" : "OFF")")
+        captureLog("Volume gate threshold: \(speechCapture.volumeGateThreshold) dB")
+
+        if let info = try? AccessibilityInspector.currentValueAndCursor(targetApp: lastExternalApp).get() {
+            let preview = String(info.text.prefix(100))
+            captureLog("Focused field: \"\(preview)\" cursor@\(info.cursorLoc)")
+        } else {
+            captureLog("Focused field: not readable")
+        }
+
+        speak("Capturing")
+        notify("Capture started", "Recording for 15 seconds. Use SpeakUp normally.")
+        appendLog("[Capture] Window opened — \(kind): \"\(description)\"")
+
+        captureWindowTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
+            self?.endCaptureWindow(kind: kind, description: description)
+        }
+    }
+
+    private func endCaptureWindow(kind: String, description: String) {
+        captureWindowActive = false
+        captureWindowTimer?.invalidate()
+        captureWindowTimer = nil
+        captureLog("CAPTURE END — \(captureWindowLog.count) events recorded")
+
+        let capturesDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/captures")
+        try? FileManager.default.createDirectory(at: capturesDir, withIntermediateDirectories: true)
+
+        let id = UUID().uuidString.prefix(8)
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filename = "capture-\(kind)-\(id).txt"
+        let fileURL = capturesDir.appendingPathComponent(filename)
+
+        var content = "SpeakUp Capture Report\n"
+        content += "======================\n"
+        content += "Type: \(kind)\n"
+        content += "Description: \(description)\n"
+        content += "Timestamp: \(timestamp)\n"
+        content += "Duration: 15 seconds\n"
+        content += "Events: \(captureWindowLog.count)\n\n"
+        content += captureWindowLog.joined(separator: "\n")
+        content += "\n"
+
+        try? content.data(using: .utf8)?.write(to: fileURL)
+
+        speak("Captured")
+        notify("Capture saved", "\(captureWindowLog.count) events → ~/Documents/SpeakUp/captures/\(filename)")
+        appendLog("[Capture] Saved \(captureWindowLog.count) events to \(filename)")
     }
 }
 
