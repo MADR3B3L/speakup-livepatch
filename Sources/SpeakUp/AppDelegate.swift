@@ -2074,6 +2074,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let wc = CandidateEngine.wordCount(phrase)
         guard wc > 0 else { return }
 
+        // Volume gate: if the peak audio during this phrase was below the
+        // threshold, it's probably ambient noise, not intentional speech.
+        if !speechCapture.isAboveVolumeGate && speechCapture.sessionPeakPower < speechCapture.volumeGateThreshold {
+            appendLog("[LivePatch] VOLUME GATE: \"\(phrase)\" rejected — peak \(String(format: "%.1f", speechCapture.sessionPeakPower)) dB below threshold \(String(format: "%.1f", speechCapture.volumeGateThreshold)) dB")
+            return
+        }
+
         // Voice commands: checked FIRST, and before any AX read. Commands
         // (starting with "paste") are implemented via synthetic keyboard
         // events rather than AX text read/write, so — unlike the

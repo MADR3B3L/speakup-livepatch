@@ -25,6 +25,20 @@ final class SpeechCapture: NSObject {
     /// is not reliably delivered before a task is cancelled.
     private(set) var lastTranscript: String = ""
 
+    /// Rolling average audio power in dB. Updated every buffer (~23ms).
+    /// Typical values: -50 dB = silence, -30 dB = ambient, -15 dB = speaking nearby, -5 dB = speaking directly.
+    private(set) var currentPowerLevel: Float = -160
+
+    /// Minimum power level to consider audio as intentional speech.
+    /// Below this, transcriptions are tagged as likely ambient.
+    var volumeGateThreshold: Float = -35
+
+    /// Whether the most recent audio buffer was above the volume gate.
+    private(set) var isAboveVolumeGate: Bool = false
+
+    /// Peak power seen during the current recognition session.
+    private(set) var sessionPeakPower: Float = -160
+
     var isRunning: Bool {
         audioEngine.isRunning
     }
@@ -84,8 +98,24 @@ final class SpeechCapture: NSObject {
         }
 
         inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+        sessionPeakPower = -160
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             request.append(buffer)
+            guard let self = self else { return }
+            guard let channelData = buffer.floatChannelData?[0] else { return }
+            let frameCount = Int(buffer.frameLength)
+            var sum: Float = 0
+            for i in 0..<frameCount {
+                let sample = channelData[i]
+                sum += sample * sample
+            }
+            let rms = sqrt(sum / max(Float(frameCount), 1))
+            let db = 20 * log10(max(rms, 1e-10))
+            self.currentPowerLevel = db
+            self.isAboveVolumeGate = db > self.volumeGateThreshold
+            if db > self.sessionPeakPower {
+                self.sessionPeakPower = db
+            }
         }
 
         audioEngine.prepare()
