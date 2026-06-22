@@ -112,14 +112,35 @@ speakup-poc/
 
 ---
 
+## Download
+
+**[Download SpeakUp](https://github.com/MADR3B3L/speakup-livepatch/releases/latest)** — unzip, open SpeakUp.app. First launch: right-click → Open, grant permissions.
+
+---
+
+## LivePatch — $39 one-time upgrade
+
+Everything in SpeakUp, plus your Mac starts learning how you work.
+
+| Feature | What it does |
+|---|---|
+| **AutoLearn** | Learns new commands from your usage automatically |
+| **Adaptive corrections** | Notices repeated patterns, asks before learning |
+| **Custom commands** | Your learned commands persist across restarts |
+| **Reports & capture** | Say "capture bug" for 15s live diagnostics |
+| **Session awareness** | Won't learn from tired/late-night sessions |
+| **App profiling** | Tracks which apps work, adapts over time |
+| **Technical support** | Say "mac support" to auto-draft a report email |
+
+Local-only. Your data never leaves your Mac. No subscription.
+
+**[Get LivePatch Alpha](https://madr3b3l.github.io/speakup-livepatch/)**
+
+---
+
 ## Status
 
-Working proof-of-concept. All core features run end-to-end on real voice input.
-Not yet distributed — pending proper code signing and packaging.
-
-This is the open core. A learning layer that adapts to your specific voice patterns and fixes your particular errors is in private development.
-
-**Early access waitlist → [speakup.app](https://speakup.app)**
+Working alpha. All core features run end-to-end on real voice input. Universal binary (Intel + Apple Silicon).
 
 ---
 
