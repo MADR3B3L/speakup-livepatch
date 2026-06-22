@@ -410,11 +410,24 @@ enum AccessibilityInspector {
         let resolved: (AXUIElement, NSRunningApplication)
         switch resolveFocusedElement(targetApp: targetApp) {
         case .success(let r): resolved = r
-        case .failure(let msg): return .failure(msg)
+        case .failure(let msg):
+            // Fallback: try walking the app's AX tree for any text field
+            if let fallback = findTextFieldInApp(targetApp: targetApp) {
+                return fallback
+            }
+            return .failure(msg)
         }
         let (element, _) = resolved
 
         guard let value = copyStringAttribute(element, kAXValueAttribute) else {
+            // Fallback: try AXSelectedText instead of AXValue
+            if let selected = copyStringAttribute(element, kAXSelectedTextAttribute), !selected.isEmpty {
+                return .success((text: selected, cursorLoc: 0))
+            }
+            // Fallback: walk the tree
+            if let fallback = findTextFieldInApp(targetApp: targetApp) {
+                return fallback
+            }
             return .failure("Focused element has no readable AXValue.")
         }
 
@@ -430,6 +443,58 @@ enum AccessibilityInspector {
 
         return .success((text: value, cursorLoc: cursorLoc))
     }
+
+    /// Fallback: walk the focused window's AX tree looking for any text element.
+    /// This helps with Electron apps and other non-standard frameworks where
+    /// the focused element isn't directly the text field.
+    private static func findTextFieldInApp(targetApp: NSRunningApplication?, maxDepth: Int = 5) -> Result<(text: String, cursorLoc: Int), String>? {
+        guard let app = targetApp ?? NSWorkspace.shared.runningApplications.first(where: { $0.isActive }) else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+
+        // Get focused window
+        var windowRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) == .success,
+              let window = windowRef else { return nil }
+
+        // Walk children looking for a text area or text field with a value
+        return walkForTextField(window as! AXUIElement, depth: 0, maxDepth: maxDepth)
+    }
+
+    private static func walkForTextField(_ element: AXUIElement, depth: Int, maxDepth: Int) -> Result<(text: String, cursorLoc: Int), String>? {
+        guard depth < maxDepth else { return nil }
+
+        // Check if this element has a role we care about
+        if let role = copyStringAttribute(element, kAXRoleAttribute) {
+            let textRoles: Set<String> = ["AXTextArea", "AXTextField", "AXComboBox", "AXWebArea"]
+            if textRoles.contains(role) {
+                if let value = copyStringAttribute(element, kAXValueAttribute), !value.isEmpty {
+                    var cursorLoc = (value as NSString).length
+                    var rangeRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+                       let rv = rangeRef {
+                        var range = CFRange(location: 0, length: 0)
+                        if AXValueGetValue((rv as! AXValue), .cfRange, &range) {
+                            cursorLoc = range.location
+                        }
+                    }
+                    return .success((text: value, cursorLoc: cursorLoc))
+                }
+            }
+        }
+
+        // Walk children
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else { return nil }
+
+        for child in children.prefix(20) {
+            if let result = walkForTextField(child, depth: depth + 1, maxDepth: maxDepth) {
+                return result
+            }
+        }
+        return nil
+    }
+
 
     /// Milestone 3 (Live Patch): replaces the given character range in the
     /// focused element with `text`. Implemented by moving the selection to
