@@ -29,6 +29,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureWindowTimer: Timer?
     private var captureWindowLog: [String] = []
     private var captureWindowStart: Date?
+    private var lastCaptureFilePath: String?
 
     // Adaptive corrections — pattern tracker + user-approved fixes.
     private var mismatchTracker: [String: (intended: String, count: Int)] = [:]
@@ -2599,17 +2600,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let filename = "support-\(id).txt"
         let fileURL = supportDir.appendingPathComponent(filename)
 
+        // Auto-include last capture if one was just taken
+        var lastCaptureContent = ""
+        if let capturePath = lastCaptureFilePath,
+           let captureData = try? String(contentsOfFile: capturePath, encoding: .utf8) {
+            lastCaptureContent = captureData
+        }
+
         var content = "SpeakUp Technical Support Report\n"
         content += "================================\n"
         content += "Date: \(ISO8601DateFormatter().string(from: Date()))\n"
         content += "App: \(lastExternalApp?.localizedName ?? "unknown")\n"
-        content += "LiveMode: \(liveModeOn ? "ON" : "OFF")\n\n"
+        content += "App family: \(AccessibilityInspector.detectAppFamily(for: lastExternalApp).rawValue)\n"
+        content += "LiveMode: \(liveModeOn ? "ON" : "OFF")\n"
+        content += "Session quality: \(sessionQuality)\n"
+        content += "Session duration: \(Int(Date().timeIntervalSince(sessionStartTime) / 60)) min\n"
+        content += "Memory: \(String(format: "%.1f", cpuSamples.last ?? 0)) MB\n\n"
+
+        if !lastCaptureContent.isEmpty {
+            content += "--- ATTACHED CAPTURE (most recent) ---\n\(lastCaptureContent)\n\n"
+        }
+
         content += "--- Recent Captures ---\n\(recentCaptures)\n\n"
         content += "--- Last 20 Log Lines ---\n\(logLines.joined(separator: "\n"))\n\n"
         content += "--- Session Stats ---\n\(statsText)\n\n"
         content += "--- Adaptive Corrections ---\n\(approvedCorrections.count) approved\n"
         for (heard, intended) in approvedCorrections {
             content += "  \"\(heard)\" → \"\(intended)\"\n"
+        }
+        content += "\n--- App Profiles ---\n"
+        for (app, profile) in appProfiles {
+            let family = profile["app_family"] as? String ?? "unknown"
+            let axOK = profile["ax_supported"] as? Bool ?? false
+            let cmds = profile["corrections_made"] as? Int ?? 0
+            let fails = profile["corrections_failed"] as? Int ?? 0
+            content += "  \(app) [\(family)] AX:\(axOK ? "yes" : "no") corrections:\(cmds) failed:\(fails)\n"
         }
 
         try? content.data(using: .utf8)?.write(to: fileURL)
@@ -2707,15 +2732,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         content += "Type: \(kind)\n"
         content += "Description: \(description)\n"
         content += "Timestamp: \(timestamp)\n"
+        content += "Session quality: \(sessionQuality)\n"
         content += "Duration: 15 seconds\n"
-        content += "Events: \(captureWindowLog.count)\n\n"
+        content += "Events: \(captureWindowLog.count)\n"
+        content += "App: \(lastExternalApp?.localizedName ?? "unknown")\n"
+        content += "App family: \(AccessibilityInspector.detectAppFamily(for: lastExternalApp).rawValue)\n"
+        content += "Memory: \(String(format: "%.1f", cpuSamples.last ?? 0)) MB\n\n"
         content += captureWindowLog.joined(separator: "\n")
         content += "\n"
 
         try? content.data(using: .utf8)?.write(to: fileURL)
+        lastCaptureFilePath = fileURL.path
 
         speak("Captured")
-        notify("Capture saved", "\(captureWindowLog.count) events → ~/Documents/SpeakUp/captures/\(filename)")
+        notify("Capture saved — say \"mac support\" to send it", "\(captureWindowLog.count) events recorded")
         appendLog("[Capture] Saved \(captureWindowLog.count) events to \(filename)")
     }
 }
