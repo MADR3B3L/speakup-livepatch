@@ -35,6 +35,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var mismatchTracker: [String: (intended: String, count: Int)] = [:]
     private var approvedCorrections: [String: String] = [:]
 
+    // Product stack detection — which add-ons are installed.
+    private var installedProducts: Set<String> = ["speakup"] // always present
+
+    private func detectInstalledProducts() {
+        let speakupDir = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp")
+        if FileManager.default.fileExists(atPath: speakupDir.appendingPathComponent("alpha-config.json").path) {
+            installedProducts.insert("livepatch")
+        }
+        if FileManager.default.fileExists(atPath: speakupDir.appendingPathComponent("veq-license.json").path) {
+            installedProducts.insert("veq")
+        }
+        if FileManager.default.fileExists(atPath: speakupDir.appendingPathComponent("buffer-license.json").path) {
+            installedProducts.insert("buffer")
+        }
+        appendLog("[Stack] Installed: \(installedProducts.sorted().joined(separator: ", "))")
+    }
+
+    private func requireProduct(_ product: String, feature: String) -> Bool {
+        if installedProducts.contains(product) { return true }
+        let productNames: [String: (name: String, desc: String)] = [
+            "livepatch": ("LivePatch", "Reports, auto-learning, custom commands, adaptive corrections"),
+            "veq": ("Veq", "Flows, AI context, memory, advanced tool calls"),
+            "buffer": ("Buffer Infrastructure", "Cross-machine communication, multi-AI, worker lanes"),
+        ]
+        let info = productNames[product] ?? (product, "Advanced features")
+        appendLog("[Stack] \(feature) requires \(info.name) — not installed")
+        notify("\(info.name) required", "\(feature) is a \(info.name) feature. \(info.desc). Visit madr3b3l.github.io/speakup-livepatch")
+        speak("\(info.name) feature")
+        return false
+    }
+
     // Session quality & chronology — time-aware behavior.
     private var sessionStartTime = Date()
     private var cpuSamples: [Double] = []
@@ -156,6 +187,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         appendLog("=== SpeakUp PoC launched ===")
         logPermissionStatus()
+        detectInstalledProducts()
         loadAdaptiveCorrections()
         loadAppProfiles()
         startCPUSampling()
@@ -1383,6 +1415,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 sendTechnicalSupport()
                 commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
                 return true
+            }
+
+            // Veq-tier commands — flows, AI context, memory
+            let veqCommands = ["send to codex", "send to claude", "send to gemini",
+                               "remember this", "recall", "what was i working on",
+                               "run flow", "start flow", "run sequence",
+                               "context", "save context", "load context"]
+            for vc in veqCommands {
+                if rest2.hasPrefix(vc) {
+                    if !requireProduct("veq", feature: "'\(vc)'") { return true }
+                    // If Veq is installed, it handles these — placeholder for now
+                    appendLog("[Veq] Would execute: \(rest2)")
+                    return true
+                }
+            }
+
+            // Buffer-tier commands — cross-machine communication
+            let bufferCommands = ["send buffer to", "paste to session",
+                                  "tell codex", "tell claude", "tell gemini",
+                                  "sync", "push to mini", "pull from mini"]
+            for bc in bufferCommands {
+                if rest2.hasPrefix(bc) {
+                    if !requireProduct("buffer", feature: "'\(bc)'") { return true }
+                    appendLog("[Buffer] Would execute: \(rest2)")
+                    return true
+                }
             }
 
             // "mac sleep" — voice panic-off: turns live mode off immediately
