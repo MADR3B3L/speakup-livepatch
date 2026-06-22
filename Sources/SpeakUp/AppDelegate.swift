@@ -1598,8 +1598,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             captureReminder(trimmed)
             notify("SpeakUp heard: \(phrase)", "Saved reminder: \"\(trimmed)\"")
         case "bug", "bugs", "issue", "issues", "feedback", "report":
-            appendLog("[SpeakUp] capture \(kind): \"\(trimmed)\"")
-            notify("SpeakUp heard: \(phrase)", "Captured \(kind): \"\(trimmed)\"")
+            appendLog("[SpeakUp] capture \(kind): \"\(trimmed)\" — LivePatch required for full reporting")
+            notify("LivePatch required", "Reports, auto-learning, and custom commands are LivePatch features. Visit madr3b3l.github.io/speakup-livepatch to upgrade.")
+            speak("LivePatch feature")
         default:
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" -> capture kind \"\(kind)\" not recognized (try \"bug\", \"issue\", \"feedback\", \"note\", \"reminder\", or \"idea\") — ignored")
             notify("SpeakUp heard: \(phrase)", "Capture type \"\(kind)\" not recognized")
