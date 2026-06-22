@@ -34,6 +34,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var mismatchTracker: [String: (intended: String, count: Int)] = [:]
     private var approvedCorrections: [String: String] = [:]
 
+    // Session quality & chronology — time-aware behavior.
+    private var sessionStartTime = Date()
+    private var cpuSamples: [Double] = []
+    private var cpuSampleTimer: Timer?
+    private var correctionTimestamps: [Date] = []
+
+    private var sessionQuality: String {
+        let hour = Calendar.current.component(.hour, from: Date())
+        let lateNight = hour >= 0 && hour < 6
+        let recentCorrections = correctionTimestamps.filter { Date().timeIntervalSince($0) < 300 }
+        let highErrorRate = recentCorrections.count > 15 // >15 corrections in 5 min = struggling
+        let sessionMinutes = Date().timeIntervalSince(sessionStartTime) / 60
+        let longSession = sessionMinutes > 120 // over 2 hours
+
+        if lateNight && highErrorRate { return "degraded" }
+        if lateNight { return "low" }
+        if highErrorRate && longSession { return "fatigued" }
+        if highErrorRate { return "struggling" }
+        if longSession { return "extended" }
+        return "normal"
+    }
+
     // Product intelligence — anonymous usage signals, no personal data.
     private var sessionStats: [String: Int] = [
         "commands_fired": 0,
@@ -135,6 +157,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logPermissionStatus()
         loadAdaptiveCorrections()
         loadAppProfiles()
+        startCPUSampling()
         installGlobalHotkeyMonitor()
         installDoubleTapMonitor()
     }
@@ -2266,6 +2289,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case .success(let detail):
                 trackStat("corrections_made")
+                correctionTimestamps.append(Date())
                 trackAppCorrection(app: lastExternalApp?.localizedName ?? "unknown", success: true)
                 captureLog("CORRECTED: \"\(word)\" → \"\(replacement)\" (sim=\(String(format: "%.2f", sim)))")
                 appendLog("[LivePatch] WRITE SUCCESS: \(detail)")
@@ -2401,8 +2425,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func promptAdaptiveCorrection(heard: String, intended: String) {
+        let quality = sessionQuality
+        if quality == "degraded" {
+            appendLog("[Adaptive] BLOCKED: \"\(heard)\" → \"\(intended)\" — session quality: \(quality) (late night + high errors). Won't learn from this.")
+            return
+        }
+        if quality == "fatigued" {
+            appendLog("[Adaptive] DELAYED: \"\(heard)\" → \"\(intended)\" — session quality: \(quality). Will re-check next session.")
+            return
+        }
+
         pendingAdaptivePrompt = (heard, intended)
-        trackStat("adaptive_prompts_shown"); appendLog("[Adaptive] Prompting: \"\(heard)\" → \"\(intended)\" (3+ occurrences)")
+        trackStat("adaptive_prompts_shown"); appendLog("[Adaptive] Prompting: \"\(heard)\" → \"\(intended)\" (3+ occurrences, quality: \(quality))")
         notify("SpeakUp noticed a pattern", "You correct \"\(heard)\" to \"\(intended)\" often. Say \"yes\" or click to approve.")
     }
 
@@ -2437,6 +2471,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stats["app_command_usage"] = appCommandCounts
         stats["total_adaptive_corrections"] = approvedCorrections.count
         stats["session_end"] = ISO8601DateFormatter().string(from: Date())
+        stats["session_start"] = ISO8601DateFormatter().string(from: sessionStartTime)
+        stats["session_duration_minutes"] = Int(Date().timeIntervalSince(sessionStartTime) / 60)
+        stats["session_quality_at_end"] = sessionQuality
+        stats["avg_memory_mb"] = cpuSamples.isEmpty ? 0 : cpuSamples.reduce(0, +) / Double(cpuSamples.count)
+        stats["peak_memory_mb"] = cpuSamples.max() ?? 0
+        stats["correction_count_last_5min"] = correctionTimestamps.filter { Date().timeIntervalSince($0) < 300 }.count
         try? FileManager.default.createDirectory(at: statsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let data = try? JSONSerialization.data(withJSONObject: stats, options: [.prettyPrinted]) {
             try? data.write(to: statsURL)
@@ -2445,8 +2485,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        cpuSampleTimer?.invalidate()
         saveUsageStats()
         saveAppProfiles()
+    }
+
+    private func startCPUSampling() {
+        cpuSampleTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let cpu = self.getProcessCPU()
+            self.cpuSamples.append(cpu)
+            if self.cpuSamples.count > 120 { self.cpuSamples.removeFirst() } // keep last 60 min
+        }
+    }
+
+    private func getProcessCPU() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.resident_size) / 1_048_576 // MB
     }
 
     // MARK: - App Environment Profiles
