@@ -856,6 +856,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // "clear" = select all, then delete — clears the focused field.
         "clear": CommandSpec(sequence: [(KeyCode.a, .maskCommand), (KeyCode.delete, [])], label: "⌘A then ⌫ (clear field)"),
         "cancel": CommandSpec(keyCode: KeyCode.escape, flags: [], label: "Escape (cancel)"),
+        "select all": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+        "select": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
+        "copy": CommandSpec(keyCode: KeyCode.c, flags: .maskCommand, label: "⌘C (copy)"),
     ]
 
     /// "media" family — playback/volume, gated behind the "media" trigger
