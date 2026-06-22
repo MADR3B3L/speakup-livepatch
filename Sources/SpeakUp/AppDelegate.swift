@@ -200,7 +200,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if app.bundleIdentifier != Bundle.main.bundleIdentifier {
             lastExternalApp = app
             appendLog("Active app changed -> \(app.localizedName ?? "?") (\(app.bundleIdentifier ?? "?"))")
-            trackAppEnvironment()
+            // trackAppEnvironment() // DISABLED: stability
         }
     }
 
@@ -2272,7 +2272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             captureLog("AX_FAIL: \(msg)")
             appendLog("[LivePatch] could not read focused field: \(msg)")
             let appName = lastExternalApp?.localizedName ?? "this app"
-            trackAppCorrection(app: appName, success: false)
+            // trackAppCorrection disabled for stability
             // Notify user that correction doesn't work here — offer support path
             let failKey = "ax_fail_\(appName)"
             let failCount = (sessionStats[failKey] ?? 0) + 1
@@ -2349,7 +2349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case .success(let detail):
                 trackStat("corrections_made")
                 correctionTimestamps.append(Date())
-                trackAppCorrection(app: lastExternalApp?.localizedName ?? "unknown", success: true)
+                // trackAppCorrection disabled for stability
                 captureLog("CORRECTED: \"\(word)\" → \"\(replacement)\" (sim=\(String(format: "%.2f", sim)))")
                 appendLog("[LivePatch] WRITE SUCCESS: \(detail)")
                 if restoreCursor != range.location + replacementNS.length {
