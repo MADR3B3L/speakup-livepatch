@@ -2574,6 +2574,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var appProfiles: [String: [String: Any]] = [:]
     private let appProfilesURL = URL(fileURLWithPath: NSHomeDirectory() + "/Documents/SpeakUp/app-profiles.json")
+    private let profileQueue = DispatchQueue(label: "com.speakup.profiles")
 
     func trackAppEnvironment() {
         guard let app = lastExternalApp else { return }
@@ -2581,13 +2582,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let bundleId = app.bundleIdentifier ?? "unknown"
         let family = AccessibilityInspector.detectAppFamily(for: app)
 
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in self?.trackAppEnvironment() }
-            return
-        }
+        profileQueue.async { [weak self] in
+            guard let self = self else { return }
 
-        if appProfiles[name] == nil {
-            appProfiles[name] = [
+        if self.appProfiles[name] == nil {
+            self.appProfiles[name] = [
                 "bundle_id": bundleId,
                 "app_family": family.rawValue,
                 "first_seen": ISO8601DateFormatter().string(from: Date()),
@@ -2597,26 +2596,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 "corrections_made": 0,
                 "corrections_failed": 0,
             ]
-            appendLog("[AppProfile] New app: \(name) — \(AccessibilityInspector.appFamilyDescription(family))")
+            self.appendLog("[AppProfile] New app: \(name) — \(AccessibilityInspector.appFamilyDescription(family))")
         }
 
         // Test AX support if we haven't yet
-        if appProfiles[name]?["ax_tested"] as? Bool == false {
-            switch AccessibilityInspector.currentValueAndCursor(targetApp: lastExternalApp) {
+        if self.appProfiles[name]?["ax_tested"] as? Bool == false {
+            switch AccessibilityInspector.currentValueAndCursor(targetApp: self.lastExternalApp) {
             case .success:
-                appProfiles[name]?["ax_supported"] = true
-                appProfiles[name]?["ax_tested"] = true
-                appendLog("[AppProfile] \(name): AX supported")
+                self.appProfiles[name]?["ax_supported"] = true
+                self.appProfiles[name]?["ax_tested"] = true
+                self.appendLog("[AppProfile] \(name): AX supported")
             case .failure:
-                appProfiles[name]?["ax_supported"] = false
-                appProfiles[name]?["ax_tested"] = true
-                appendLog("[AppProfile] \(name): AX not supported — commands only, no corrections")
+                self.appProfiles[name]?["ax_supported"] = false
+                self.appProfiles[name]?["ax_tested"] = true
+                self.appendLog("[AppProfile] \(name): AX not supported — commands only, no corrections")
             }
         }
+        } // end profileQueue.async
     }
 
     func trackAppCorrection(app: String, success: Bool) {
-        DispatchQueue.main.async { [weak self] in
+        profileQueue.async { [weak self] in
             guard let self = self else { return }
             if success {
                 self.appProfiles[app]?["corrections_made"] = ((self.appProfiles[app]?["corrections_made"] as? Int) ?? 0) + 1
