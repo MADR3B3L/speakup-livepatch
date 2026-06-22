@@ -2579,8 +2579,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let app = lastExternalApp else { return }
         let name = app.localizedName ?? "unknown"
         let bundleId = app.bundleIdentifier ?? "unknown"
-
         let family = AccessibilityInspector.detectAppFamily(for: app)
+
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.trackAppEnvironment() }
+            return
+        }
 
         if appProfiles[name] == nil {
             appProfiles[name] = [
@@ -2612,10 +2616,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func trackAppCorrection(app: String, success: Bool) {
-        if success {
-            appProfiles[app]?["corrections_made"] = ((appProfiles[app]?["corrections_made"] as? Int) ?? 0) + 1
-        } else {
-            appProfiles[app]?["corrections_failed"] = ((appProfiles[app]?["corrections_failed"] as? Int) ?? 0) + 1
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if success {
+                self.appProfiles[app]?["corrections_made"] = ((self.appProfiles[app]?["corrections_made"] as? Int) ?? 0) + 1
+            } else {
+                self.appProfiles[app]?["corrections_failed"] = ((self.appProfiles[app]?["corrections_failed"] as? Int) ?? 0) + 1
+            }
         }
     }
 
