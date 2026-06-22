@@ -2445,9 +2445,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let name = app.localizedName ?? "unknown"
         let bundleId = app.bundleIdentifier ?? "unknown"
 
+        let family = AccessibilityInspector.detectAppFamily(for: app)
+
         if appProfiles[name] == nil {
             appProfiles[name] = [
                 "bundle_id": bundleId,
+                "app_family": family.rawValue,
                 "first_seen": ISO8601DateFormatter().string(from: Date()),
                 "ax_supported": false,
                 "ax_tested": false,
@@ -2455,6 +2458,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 "corrections_made": 0,
                 "corrections_failed": 0,
             ]
+            appendLog("[AppProfile] New app: \(name) — \(AccessibilityInspector.appFamilyDescription(family))")
         }
 
         // Test AX support if we haven't yet

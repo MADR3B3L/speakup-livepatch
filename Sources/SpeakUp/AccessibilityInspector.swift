@@ -52,6 +52,64 @@ enum AccessibilityInspector {
     /// We bypass the cache by making a real AX API call and checking the error
     /// code: kAXErrorNotTrusted (-25211) means genuinely not trusted right now.
     /// Any other result (success, noValue, etc.) means we ARE trusted.
+    // MARK: - App Family Detection
+
+    enum AppFamily: String {
+        case native = "native"           // Apple-native apps, full AX
+        case electron = "electron"       // VS Code, Slack, Discord, Claude desktop
+        case adobe = "adobe"             // Photoshop, Illustrator, etc
+        case chromium = "chromium"       // Chrome, Edge, Brave — browser fields
+        case java = "java"              // Java/Swing enterprise apps
+        case unknown = "unknown"
+    }
+
+    static func detectAppFamily(for app: NSRunningApplication?) -> AppFamily {
+        guard let bundleId = app?.bundleIdentifier else { return .unknown }
+        let bid = bundleId.lowercased()
+
+        if bid.hasPrefix("com.apple.") { return .native }
+
+        if bid.contains("adobe") || bid.contains("photoshop") || bid.contains("illustrator")
+            || bid.contains("indesign") || bid.contains("premiere") || bid.contains("aftereffects") {
+            return .adobe
+        }
+
+        if bid.contains("google.chrome") || bid.contains("brave") || bid.contains("microsoft.edgemac")
+            || bid.contains("arc") || bid.contains("vivaldi") || bid.contains("opera") {
+            return .chromium
+        }
+
+        // Electron detection: check for Electron Helper in running processes
+        // or known Electron bundle IDs
+        if bid.contains("vscode") || bid.contains("visual-studio-code")
+            || bid.contains("slack") || bid.contains("discord")
+            || bid.contains("anthropic") || bid.contains("notion")
+            || bid.contains("figma") || bid.contains("spotify")
+            || bid.contains("teams") || bid.contains("whatsapp")
+            || bid.contains("atom") || bid.contains("postman") {
+            return .electron
+        }
+
+        // Java detection
+        if bid.contains("java") || bid.contains("jetbrains")
+            || bid.contains("intellij") || bid.contains("eclipse") {
+            return .java
+        }
+
+        return .native  // default: try native AX
+    }
+
+    static func appFamilyDescription(_ family: AppFamily) -> String {
+        switch family {
+        case .native: return "Native macOS (full support)"
+        case .electron: return "Electron app (commands work, corrections limited)"
+        case .adobe: return "Adobe app (commands work, corrections limited)"
+        case .chromium: return "Browser (commands work, web field corrections vary)"
+        case .java: return "Java app (commands work, corrections limited)"
+        case .unknown: return "Unknown framework"
+        }
+    }
+
     static func isTrusted(promptIfNeeded: Bool) -> Bool {
         if promptIfNeeded {
             // Trigger the system prompt if needed — but ignore the cached return value.
@@ -60,9 +118,12 @@ enum AccessibilityInspector {
         }
         // Live probe: hits the AX server directly, not the per-process cache.
         // kAXErrorNotTrusted = -25211 (not bridged as a Swift enum case).
+        // Use CopyAttributeNames on the system-wide element — always returns
+        // names when trusted regardless of whether any app has focus, so we
+        // don't get false-positives from kAXErrorNoValue on an empty focus state.
         let systemWide = AXUIElementCreateSystemWide()
-        var ref: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &ref)
+        var names: CFArray?
+        let err = AXUIElementCopyAttributeNames(systemWide, &names)
         return err.rawValue != -25211
     }
 
