@@ -259,6 +259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let handler: (NSEvent) -> Void = { [weak self] event in
             guard let self = self else { return }
+            self.checkPhysicalKeyStopsBackspace(event)
             let mods: NSEvent.ModifierFlags = [.control, .option, .command]
             guard event.modifierFlags.contains(mods) else { return }
             if event.keyCode == self.kVK_ANSI_I {
@@ -271,7 +272,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
-        // Local monitor catches the hotkey when SpeakUp's own alert/menu is key.
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             handler(event)
             return event
@@ -628,10 +628,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let isLongDictationCommand = partial.hasPrefix("report ") || partial.hasPrefix("mac report")
             || partial.hasPrefix("capture bug") || partial.hasPrefix("capture issue")
             || partial.hasPrefix("capture feedback")
-        let isShortKnownCommand = Self.commands[partial] != nil
+        let isShortKnownCommand = Self.registry.contains(partial)
             || partial == "paste" || partial == "undo" || partial == "redo" || partial == "clear"
             || partial == "select all" || partial == "select" || partial == "copy"
-            || partial.hasPrefix("action ") && Self.commands[String(partial.dropFirst("action ".count))] != nil
+            || partial.hasPrefix("action ") && Self.registry.contains(String(partial.dropFirst("action ".count)))
         let delay = isLongDictationCommand ? phraseSettleDelay + 1.0
             : isShortKnownCommand ? 0.7
             : phraseSettleDelay
@@ -755,6 +755,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var sequence: [(keyCode: CGKeyCode, flags: CGEventFlags)]? = nil
         let label: String
     }
+
+    enum CommandFamily: String {
+        case action, direct, media, display, user
+    }
+
+    private class CommandRegistry {
+        private var entries: [String: (spec: CommandSpec, family: CommandFamily)] = [:]
+
+        func register(_ phrase: String, spec: CommandSpec, family: CommandFamily) {
+            entries[phrase.lowercased()] = (spec, family)
+        }
+
+        func lookup(_ phrase: String) -> CommandSpec? {
+            entries[phrase.lowercased()]?.spec
+        }
+
+        func lookup(_ phrase: String, family: CommandFamily) -> CommandSpec? {
+            guard let entry = entries[phrase.lowercased()], entry.family == family else { return nil }
+            return entry.spec
+        }
+
+        func contains(_ phrase: String) -> Bool {
+            entries[phrase.lowercased()] != nil
+        }
+
+        func contains(_ phrase: String, family: CommandFamily) -> Bool {
+            guard let entry = entries[phrase.lowercased()] else { return false }
+            return entry.family == family
+        }
+
+        var allKeys: [String] { Array(entries.keys) }
+        var count: Int { entries.count }
+    }
+
+    private static let registry: CommandRegistry = {
+        let r = CommandRegistry()
+        for (k, v) in commands { r.register(k, spec: v, family: .action) }
+        for (k, v) in directCommands { r.register(k, spec: v, family: .direct) }
+        for (k, v) in mediaCommands { r.register(k, spec: v, family: .media) }
+        for (k, v) in displayCommands { r.register(k, spec: v, family: .display) }
+        return r
+    }()
 
     /// The command vocabulary. Each entry is a phrase that can follow
     /// "action " (e.g. "action paste", "action copy"); several phrases can
@@ -922,8 +964,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // --- System-level ---
         "screenshot": CommandSpec(keyCode: KeyCode.four, flags: [.maskCommand, .maskShift], label: "⇧⌘4 (screenshot)"),
+        "take screenshot": CommandSpec(keyCode: KeyCode.four, flags: [.maskCommand, .maskShift], label: "⇧⌘4 (screenshot)"),
+        "take a screenshot": CommandSpec(keyCode: KeyCode.four, flags: [.maskCommand, .maskShift], label: "⇧⌘4 (screenshot)"),
         "emoji": CommandSpec(keyCode: KeyCode.space, flags: [.maskCommand, .maskControl], label: "⌃⌘Space (emoji picker)"),
         "mission control": CommandSpec(keyCode: KeyCode.upArrow, flags: .maskControl, label: "⌃↑ (Mission Control)"),
+        "go back": CommandSpec(keyCode: KeyCode.leftBracket, flags: .maskCommand, label: "⌘[ (back)"),
+        "go forward": CommandSpec(keyCode: KeyCode.rightBracket, flags: .maskCommand, label: "⌘] (forward)"),
+        "go home": CommandSpec(keyCode: KeyCode.upArrow, flags: .maskCommand, label: "⌘↑ (document start)"),
+        "close this": CommandSpec(keyCode: KeyCode.w, flags: .maskCommand, label: "⌘W (close)"),
+        "close it": CommandSpec(keyCode: KeyCode.w, flags: .maskCommand, label: "⌘W (close)"),
+        "save this": CommandSpec(keyCode: KeyCode.s, flags: .maskCommand, label: "⌘S (save)"),
+        "save it": CommandSpec(keyCode: KeyCode.s, flags: .maskCommand, label: "⌘S (save)"),
+        "find this": CommandSpec(keyCode: KeyCode.f, flags: .maskCommand, label: "⌘F (find)"),
+        "copy this": CommandSpec(keyCode: KeyCode.c, flags: .maskCommand, label: "⌘C (copy)"),
+        "cut this": CommandSpec(keyCode: KeyCode.x, flags: .maskCommand, label: "⌘X (cut)"),
+        "undo this": CommandSpec(keyCode: KeyCode.z, flags: .maskCommand, label: "⌘Z (undo)"),
+        "make bigger": CommandSpec(keyCode: KeyCode.equals, flags: .maskCommand, label: "⌘+ (zoom in)"),
+        "make smaller": CommandSpec(keyCode: KeyCode.minus, flags: .maskCommand, label: "⌘- (zoom out)"),
+        "make it bigger": CommandSpec(keyCode: KeyCode.equals, flags: .maskCommand, label: "⌘+ (zoom in)"),
+        "make it smaller": CommandSpec(keyCode: KeyCode.minus, flags: .maskCommand, label: "⌘- (zoom out)"),
+        "refresh page": CommandSpec(keyCode: KeyCode.r, flags: .maskCommand, label: "⌘R (reload)"),
+        "open tab": CommandSpec(keyCode: KeyCode.t, flags: .maskCommand, label: "⌘T (new tab)"),
+        "open new tab": CommandSpec(keyCode: KeyCode.t, flags: .maskCommand, label: "⌘T (new tab)"),
+        "go full screen": CommandSpec(keyCode: KeyCode.f, flags: [.maskCommand, .maskControl], label: "⌃⌘F (toggle full screen)"),
+        "delete this": CommandSpec(keyCode: KeyCode.delete, flags: [], label: "⌫ (backspace)"),
+        "delete all": CommandSpec(sequence: [(KeyCode.a, .maskCommand), (KeyCode.delete, [])], label: "⌘A then ⌫ (clear field)"),
+        "select everything": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
     ]
 
     /// "direct" family — no prefix, no command-mode window, ALWAYS
@@ -939,14 +1005,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// a one-line change, not a redesign.
     private static let directCommands: [String: CommandSpec] = [
         "paste": CommandSpec(keyCode: KeyCode.v, flags: .maskCommand, label: "⌘V (paste)"),
+        "paste it": CommandSpec(keyCode: KeyCode.v, flags: .maskCommand, label: "⌘V (paste)"),
+        "paste that": CommandSpec(keyCode: KeyCode.v, flags: .maskCommand, label: "⌘V (paste)"),
         "undo": CommandSpec(keyCode: KeyCode.z, flags: .maskCommand, label: "⌘Z (undo)"),
+        "undo that": CommandSpec(keyCode: KeyCode.z, flags: .maskCommand, label: "⌘Z (undo)"),
         "redo": CommandSpec(keyCode: KeyCode.z, flags: [.maskCommand, .maskShift], label: "⇧⌘Z (redo)"),
-        // "clear" = select all, then delete — clears the focused field.
         "clear": CommandSpec(sequence: [(KeyCode.a, .maskCommand), (KeyCode.delete, [])], label: "⌘A then ⌫ (clear field)"),
+        "clear all": CommandSpec(sequence: [(KeyCode.a, .maskCommand), (KeyCode.delete, [])], label: "⌘A then ⌫ (clear field)"),
         "cancel": CommandSpec(keyCode: KeyCode.escape, flags: [], label: "Escape (cancel)"),
+        "never mind": CommandSpec(keyCode: KeyCode.escape, flags: [], label: "Escape (cancel)"),
         "select all": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
         "select": CommandSpec(keyCode: KeyCode.a, flags: .maskCommand, label: "⌘A (select all)"),
         "copy": CommandSpec(keyCode: KeyCode.c, flags: .maskCommand, label: "⌘C (copy)"),
+        "copy that": CommandSpec(keyCode: KeyCode.c, flags: .maskCommand, label: "⌘C (copy)"),
+        "copy this": CommandSpec(keyCode: KeyCode.c, flags: .maskCommand, label: "⌘C (copy)"),
+        "delete": CommandSpec(keyCode: KeyCode.delete, flags: [], label: "⌫ (backspace)"),
     ]
 
     /// "media" family — playback/volume, gated behind the "media" trigger
@@ -1124,7 +1197,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // directCommands doc comment: if these collide with normal
         // dictation or corrections, move the offending one back into
         // `commands` (the "action ___" family).
-        if let spec = Self.directCommands[normalized] {
+        if let spec = Self.registry.lookup(normalized, family: .direct) {
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" (direct) -> simulating \(spec.label)")
             runCommandSpec(spec)
             commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
@@ -1545,7 +1618,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // repeating "media" each time.
         if let first = words.first, first == Self.mediaTriggerWord, words.count > 1 {
             let rest = words.dropFirst().joined(separator: " ")
-            guard let spec = Self.mediaCommands[rest] else {
+            guard let spec = Self.registry.lookup(rest, family: .media) else {
                 appendLog("[LivePatch] heard trigger word \"\(Self.mediaTriggerWord)\" but \"\(rest)\" isn't a recognized media command — ignored.")
                 notify("SpeakUp heard: \(phrase)", "Not a recognized media command")
                 return true
@@ -1560,7 +1633,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Bare media word ("next", "mute", ...) inside the 5s media window
         // opened by a prior "media ___" command.
-        if inMediaMode, let spec = Self.mediaCommands[normalized] {
+        if inMediaMode, let spec = Self.registry.lookup(normalized, family: .media) {
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" (bare word, media mode) -> simulating \(spec.label)")
             runCommandSpec(spec)
             mediaModeUntil = Date().addingTimeInterval(Self.shortModeWindow)
@@ -1573,7 +1646,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Mirrors "media": always active, opens its own short 5s window.
         if let first = words.first, first == Self.displayTriggerWord, words.count > 1 {
             let rest = words.dropFirst().joined(separator: " ")
-            guard let spec = Self.displayCommands[rest] else {
+            guard let spec = Self.registry.lookup(rest, family: .display) else {
                 appendLog("[LivePatch] heard trigger word \"\(Self.displayTriggerWord)\" but \"\(rest)\" isn't a recognized display command — ignored.")
                 notify("SpeakUp heard: \(phrase)", "Not a recognized display command")
                 return true
@@ -1588,7 +1661,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Bare display word ("lock", "sleep", ...) inside the 5s display
         // window opened by a prior "display ___" command.
-        if inDisplayMode, let spec = Self.displayCommands[normalized] {
+        if inDisplayMode, let spec = Self.registry.lookup(normalized, family: .display) {
             appendLog("[LivePatch] COMMAND: \"\(phrase)\" (bare word, display mode) -> simulating \(spec.label)")
             runCommandSpec(spec)
             displayModeUntil = Date().addingTimeInterval(Self.shortModeWindow)
@@ -1611,12 +1684,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // --- "report <kind> <text...>" family ---
-        // "report bug" alone is valid — saves context snapshot with no body text.
-        // "report bug paste fired twice" includes a description too.
+        // "report issue" = instant snapshot AFTER the fact (no recording window)
+        // In SpeakUp (free), reports go through handleCapture as feedback.
+        // LivePatch has the full saveReport with debug context.
         if let first = words.first, first == Self.reportTriggerWord, words.count > 1 {
             let kind = words[1]
             let text = words.count > 2 ? words.dropFirst(2).joined(separator: " ") : ""
-            handleCapture(kind: kind, text: text, phrase: phrase)
+            handleCapture(kind: "feedback", text: "\(kind): \(text)", phrase: phrase)
             commandModeUntil = Date().addingTimeInterval(Self.commandModeWindow)
             return true
         }
@@ -1627,7 +1701,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let first = words.first, first == Self.commandTriggerWord, words.count > 1 {
             rest = words.dropFirst().joined(separator: " ")
             triggeredByActionWord = true
-        } else if inCommandMode, userCommands[normalized] != nil || Self.commands[normalized] != nil {
+        } else if inCommandMode, userCommands[normalized] != nil || Self.registry.contains(normalized, family: .action) {
             // Bare command word inside the 30s window after a prior command.
             rest = normalized
             triggeredByActionWord = false
@@ -1635,7 +1709,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
-        guard let spec = userCommands[rest] ?? Self.commands[rest] else {
+        guard let spec = userCommands[rest] ?? Self.registry.lookup(rest, family: .action) else {
             // Only "action <unrecognized>" gets here (the bare-word branch
             // above already checked Self.commands[normalized] != nil) —
             // swallow it so an unrecognized command word doesn't also get
@@ -1676,11 +1750,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    private var backspaceHoldStart: Date?
+    private var backspaceAutoStopTimer: Timer?
+
     private func startBackspaceHold() {
         stopBackspaceHold()
-        speak("Holding")
+        backspaceHoldStart = Date()
+        speak("Say when")
         backspaceHoldTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
             self?.simulateKeyCombo(keyCode: KeyCode.delete, flags: [], label: "⌫ (hold)")
+        }
+        backspaceAutoStopTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
+            self?.appendLog("[LivePatch] backspace auto-stopped after 10s")
+            self?.stopBackspaceHold()
         }
     }
 
@@ -1688,7 +1770,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard backspaceHoldTimer != nil else { return }
         backspaceHoldTimer?.invalidate()
         backspaceHoldTimer = nil
+        backspaceAutoStopTimer?.invalidate()
+        backspaceAutoStopTimer = nil
+        let duration = backspaceHoldStart.map { String(format: "%.1fs", Date().timeIntervalSince($0)) } ?? ""
+        appendLog("[LivePatch] backspace hold stopped \(duration)")
         speak("Done")
+    }
+
+    func checkPhysicalKeyStopsBackspace(_ event: NSEvent) {
+        guard backspaceHoldTimer != nil else { return }
+        guard let start = backspaceHoldStart, Date().timeIntervalSince(start) > 1.0 else { return }
+        if event.keyCode == KeyCode.delete || event.keyCode == KeyCode.escape {
+            appendLog("[LivePatch] backspace stopped by physical key (\(event.keyCode == KeyCode.escape ? "esc" : "backspace"))")
+            stopBackspaceHold()
+        }
     }
 
     /// Dispatches a `CommandSpec` to whichever execution path it specifies —
@@ -2241,7 +2336,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fuzzy command match: if the phrase is close to a known command,
         // treat it as that command instead of a correction attempt.
-        let allCommandKeys = Array(Self.directCommands.keys) + Array(Self.commands.keys)
+        let allCommandKeys = Self.registry.allKeys
         if let fuzzy = CandidateEngine.bestCommandMatch(for: phrase, in: allCommandKeys) {
             trackStat("commands_fuzzy_matched"); captureLog("FUZZY: \"\(phrase)\" → \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
             appendLog("[LivePatch] FUZZY COMMAND: heard \"\(phrase)\" → matched \"\(fuzzy.command)\" (sim=\(String(format: "%.2f", fuzzy.similarity)))")
