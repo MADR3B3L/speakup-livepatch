@@ -42,7 +42,7 @@ final class SpeechCapture: NSObject {
     /// Adaptive gate: rolling ambient noise floor, updated every buffer.
     private var ambientSamples: [Float] = []
     private static let ambientWindowSize = 50
-    private static let ambientMargin: Float = 12
+    private static let ambientMargin: Float = 15
     private(set) var ambientFloor: Float = -50
     var adaptiveGateEnabled: Bool = true
 
@@ -80,6 +80,27 @@ final class SpeechCapture: NSObject {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        request.taskHint = .search
+        if #available(macOS 13, *) {
+            request.requiresOnDeviceRecognition = true
+        }
+        request.contextualStrings = [
+            "mac", "max", "action", "media", "display", "capture", "report",
+            "open", "close", "quit", "hide", "show", "prepare", "search", "find",
+            "notes", "chrome", "safari", "finder", "mail", "calendar", "music",
+            "reminders", "messages", "photos", "maps", "terminal", "claude",
+            "copy", "paste", "cut", "undo", "redo", "save", "select", "delete",
+            "insert", "type", "dictate",
+            "next", "previous", "back", "forward", "tab",
+            "play", "pause", "mute", "unmute", "volume",
+            "brightness", "screenshot", "spotlight", "lock",
+            "minimize", "fullscreen", "focus", "work with",
+            "note", "reminder", "bug", "issue", "feedback",
+            "send", "buffer", "codex", "veq",
+            "bold", "italic", "checklist",
+            "new tab", "close tab", "reload", "bookmark", "history",
+            "duplicate", "preferences", "settings",
+        ]
         recognitionRequest = request
         lastTranscript = ""
 
